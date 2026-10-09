@@ -3,15 +3,15 @@ task: >
   `strata-iq3_s.json` (Qwen3.8-Flash-Next IQ3_S on this ROCm/HIP machine, gfx1151)
   to at least 80 decode tokens/sec, measured by bench/ab_bench.py under the A/B
   GPU-exclusive protocol (production service stopped, 3 cold boots of the candidate
-  spec on port 8101, one 512-token streaming generation per boot, streaming-token
-  timing). Prefill TPS must stay at or above the bound measured from the current
-  baseline spec. The bench and its prompt are the fitness function and are not
-  yours to change. `strata-iq3_s.json` must remain a valid production
-  configuration of the same model (same pack/native/ple/mtp paths); only
-  performance-relevant args and env may change. Known levers, from the author's
-  own experiments: `--spec`, `--spec-min-p`, `--lookup-chain`, `--mtp-q4`,
-  `--prefill`, `--kv-resident`, the STRATA_* env flags, the hipblaslt tuning table,
-  and the engine source under src/ / serve/.
+  spec on port 8101, one streamed generation per boot requesting 1024 tokens,
+  streaming-token timing). Prefill TPS must stay at or above the bound measured
+  from the current baseline spec. The bench and its prompt are the fitness
+  function and are not yours to change. `strata-iq3_s.json` must remain a valid
+  production configuration of the same model (same pack/native/ple/mtp paths);
+  only performance-relevant args and env may change. Known levers, from the
+  author's own experiments: `--spec`, `--spec-min-p`, `--lookup-chain`,
+  `--mtp-q4`, `--prefill`, `--kv-resident`, the STRATA_* env flags, the
+  hipblaslt tuning table, and the engine source under src/ / serve/.
 
 setup:
   repo:
@@ -34,12 +34,13 @@ setup:
 stages:
   - name: decode-80
     task: >
-      Make the candidate spec reach decode_tps >= 80 (median of 3 cold-boot runs)
-      while keeping prefill_tps above the declared bound and every one of the 3
-      runs completing its full 512-token generation. Start by reproducing the
-      baseline reading on the unchanged tree, then change ONE lever at a time and
-      let the probe grade it. Do not touch bench/ or anything excluded from your
-      editable region.
+      Make the candidate spec reach decode_tps >= 80 (median of 3 cold-boot
+      runs) while keeping prefill_tps above the declared bound, with all 3 boots
+      completing a generation of at least 512 tokens (the bench requests 1024;
+      the model's greedy natural stop is ~902). Start by reproducing the
+      baseline reading on the unchanged tree, then change ONE lever at a time
+      and let the probe grade it. Do not touch bench/ or anything excluded from
+      your editable region.
     knowledge: [perf_claim_protocol]
     measure:
       - name: ab_gpu_exclusive
@@ -49,13 +50,13 @@ stages:
         reports:
           decode_tps:
             unit: tok/s
-            means: median decode tokens/sec over 3 cold-boot 512-token runs
+            means: median decode tokens/sec over 3 cold-boot runs
           prefill_tps:
             unit: tok/s
             means: median prompt tokens/sec (prompt_tokens / time-to-first-token) over the same runs
           runs_complete:
             unit: fraction
-            means: share of the 3 boots that completed the full 512-token generation
+            means: share of the 3 boots whose generation completed with at least 512 tokens
           decode_tps_min:
             unit: tok/s
             means: worst single boot
@@ -80,7 +81,7 @@ stages:
       - bound: "runs_complete >= 1.0"
         on_violation: block
         holds: stage
-        why: a TPS from fewer than 3 full 512-token runs is a TPS for a shorter and easier bench
+        why: a TPS from fewer than 3 completed generations of >=512 tokens is a TPS for a shorter and easier bench
 
 models:
   framework: {provider: codex}

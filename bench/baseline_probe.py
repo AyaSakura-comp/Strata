@@ -1,13 +1,14 @@
 """bench/baseline_probe.py — read-only baseline reading from the PRODUCTION server.
 
 Sends the exact bench prompt (from bench/decode_bench.py, so the two can never
-drift) as one streaming request to the production server on port 8090 and times
-it. Stops nothing, changes nothing: production keeps serving.
+drift) as one streaming 1024-token request to the production server on port
+8090 and times it. Stops nothing, changes nothing: production keeps serving.
 
-Generation length is 512 tokens (not 1024): under greedy decoding the model's
-natural stop is ~902 tokens, so a 1024-token request can never complete; 512 is
-well below it, so every reading completes the full request. This matches the
-A/B probe bench/ab_bench.py.
+A reading counts when the generation completes with >= 512 tokens: under greedy
+decoding the model's natural stop is ~902 tokens, so a request cannot "complete
+all 1024"; and requesting FEWER than ~1024 tokens (tried 512) can make this
+server finish immediately with zero content. These match the A/B probe
+bench/ab_bench.py.
 
 The number this yields is measured under production conditions (warm resident
 model), not under the A/B cold-boot protocol of ab_bench.py; it is a reference
@@ -28,9 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import decode_bench as db  # noqa: E402
 
-db.GEN_TOKENS = 512  # request length; below the model's ~902-token natural stop
-
 PROD_PORT = 8090
+MIN_COMPLETION = 512  # tokens; below the model's ~902-token natural stop
 
 KEYS = [
     "decode_tps",               # decode tok/s on the production server
@@ -57,7 +57,7 @@ def main() -> int:
     t0 = time.perf_counter()
     r = db.generate_once(PROD_PORT, model)
     total = time.perf_counter() - t0
-    if r is None or r["completion_tokens"] < db.GEN_TOKENS:
+    if r is None or r["completion_tokens"] < MIN_COMPLETION:
         print("baseline generation failed or incomplete on production", file=sys.stderr)
         emit(metrics)
         return 1
