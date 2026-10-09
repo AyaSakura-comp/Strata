@@ -20,6 +20,10 @@ under ~/.evo/runs/... that contains COMMITTED files only):
   the framework refuse the round as region_violated (observed on this run:
   the spec-boot<N>.json copies written by a bench invocation from inside the
   worktree refused two consecutive rounds).
+- A startup guard refuses to run (exit 1, full key set, production untouched)
+  if the artifact dir would ever resolve inside the measured tree, and stale
+  artifacts from earlier invocations are removed before the first boot so
+  parsing never reads a crashed run's spec or logs.
 
 Metric definitions (all reported per reading, median + worst of the boots):
 - prefill_tps_engine / decode_tps_engine — the ENGINE's own rates, parsed from
@@ -94,8 +98,34 @@ def main() -> int:
     except Exception:
         model = "default"
 
-    # GPU exclusivity: take production down.
-    if not db.service_ctl("stop"):
+    # Region guard: in a run the measured tree is a git worktree of committed
+    # files (WORKTREE != REAL_REPO); probe artifacts must never land inside it,
+    # or every later round is refused region_violated (rounds 1-5 of the first
+    # decode-80 run died exactly this way). Fail BEFORE stopping production.
+    if WORKTREE.resolve() != REAL_REPO.resolve():
+        try:
+            tmp_r, wt_r = db.TMP.resolve(), WORKTREE.resolve()
+            if tmp_r == wt_r or wt_r in tmp_r.parents:
+                instrument_error = (
+                    f"probe artifact dir {tmp_r} lies inside the measured tree "
+                    f"{wt_r}; refusing to pollute it"
+                )
+        except Exception:
+            pass  # a path-resolution failure here must not block measuring
+
+    # Stale-artifact cleanup: drop only our own known patterns under db.TMP so
+    # per-boot parsing never reads a previous (possibly crashed) invocation's
+    # spec copy or logs.
+    if instrument_error is None:
+        for _pat in ("spec-boot*.json", "server-boot*.log", "engine-boot*.log"):
+            for _f in db.TMP.glob(_pat):
+                try:
+                    _f.unlink()
+                except OSError:
+                    pass
+
+    # GPU exclusivity: take production down (only when the guard above passed).
+    if instrument_error is None and not db.service_ctl("stop"):
         instrument_error = "could not stop strata.service (no working systemctl path)"
     if instrument_error is None:
         db.cleanup_leftovers()
