@@ -5,6 +5,8 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/artifact/gguf_reader.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -628,12 +630,57 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
             dvocab_host_.resize((size_t) n_dvocab_);
             std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
-            std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
-                         (double) (n_dvocab_ * row_bytes) / 1048576.0);
-            dhead_type_ = head->type();
+            // decode-80: STRATA_MTP_HEAD_GGUF=<shard.gguf> gathers the draft rows from that file's output.weight
+            // instead of the main head (e.g. an IQ4_XS copy: ~2/3 the bytes per draft step; the draft's
+            // proposals are the only thing it touches, the verified model is unchanged).
+            const char* ext_head = std::getenv("STRATA_MTP_HEAD_GGUF");
+            bool ext_ok = false;
+            if (ext_head != nullptr && ext_head[0] != '\0') {
+                try {
+                    strata::GgufFile eg(ext_head);
+                    const strata::TensorInfo* et = nullptr;
+                    for (const auto& t : eg.tensors())
+                        if (t.name == "output.weight") { et = &t; break; }
+                    if (et == nullptr || et->shape.size() != 2 || (int64_t) et->shape[1] != n_vocab_ ||
+                        (int64_t) et->shape[0] != wo->ne0) {
+                        err = "mtp: STRATA_MTP_HEAD_GGUF output.weight shape mismatch";
+                        return false;
+                    }
+                    const int64_t erow = (int64_t) strata::kernels::iq_row_bytes((int) et->type, (int64_t) et->shape[0]);
+                    if (erow <= 0) { err = "mtp: STRATA_MTP_HEAD_GGUF output.weight type unsupported"; return false; }
+                    if (cudaFree(dhead_) != cudaSuccess ||
+                        cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * erow)) != cudaSuccess) {
+                        err = "mtp: the external draft head does not fit";
+                        return false;
+                    }
+                    std::vector<uint8_t> stage((size_t) (n_dvocab_ * erow));
+                    const uint8_t* src = eg.tensor_data(*et);
+                    for (int64_t r = 0; r < n_dvocab_; ++r) {
+                        const int32_t id = dvocab_host_[(size_t) r];
+                        if (id < 0 || id >= n_vocab_) { err = "mtp: draft vocab id out of range"; return false; }
+                        std::memcpy(stage.data() + (size_t) r * erow, src + (size_t) id * erow, (size_t) erow);
+                    }
+                    cudaMemcpy(dhead_, stage.data(), stage.size(), cudaMemcpyHostToDevice);
+                    cudaDeviceSynchronize();
+                    vram_ = vram_ - (uint64_t) (n_dvocab_ * row_bytes) + (uint64_t) (n_dvocab_ * erow);
+                    std::fprintf(stderr, "strata mtp: draft head over %lld tokens from %s (%.1f MiB, %s)\n",
+                                 (long long) n_dvocab_, ext_head, (double) (n_dvocab_ * erow) / 1048576.0,
+                                 et->type_name());
+                    dhead_type_ = (int) et->type;
+                    ext_ok = true;
+                } catch (const std::exception& e) {
+                    err = std::string("mtp: STRATA_MTP_HEAD_GGUF: ") + e.what();
+                    return false;
+                }
+            }
+            if (!ext_ok) {
+                strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_,
+                                             nullptr);
+                cudaDeviceSynchronize();
+                std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
+                             (double) (n_dvocab_ * row_bytes) / 1048576.0);
+                dhead_type_ = head->type();
+            }
             if (q4_head_ && !make_q4_head(err)) return false;
             if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,

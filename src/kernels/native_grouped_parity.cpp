@@ -349,6 +349,9 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);
+    check(22, 42, 2560, 640, s, rng);  // the IQ2_XS pack's shapes (decode-80): exercises STRATA_GU_RPW/DOWN_RPW
+    check(16, 42, 2560, 640, s, rng);
+    check(29, 42, 2560, 640, s, rng);
     if (do_bench) bench(s, rng);
     std::printf("native_grouped_parity: %d failures\n", g_fail);
     cudaStreamDestroy(s);

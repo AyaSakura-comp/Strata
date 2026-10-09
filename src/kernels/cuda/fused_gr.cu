@@ -1158,6 +1158,7 @@ constexpr int Q8_KC = 640, Q8_NKC = D / Q8_KC;      // 16 chunks, 4 per stream
 constexpr int Q8_CPS = N / Q8_KC;                   // chunks per stream
 constexpr int Q8_SPB = Q8_KC / 128;                 // 5 steps of 4 Q8_0 blocks (8 lanes x 4 values each)
 __device__ __forceinline__ uint32_t q8_ld16(const uint8_t* p) { return *(const uint16_t*) p; }
+__device__ __forceinline__ uint32_t q8_ld32(const uint8_t* p) { return *(const uint32_t*) p; }
 __device__ __forceinline__ float q8_half(uint32_t h) { return __half2float(__ushort_as_half((unsigned short) h)); }
 __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
     return make_float4(d * (float) (int8_t) (q & 255u), d * (float) (int8_t) ((q >> 8) & 255u),

@@ -1117,6 +1117,104 @@ __device__ __forceinline__ void row_dot_80_sub16(const uint8_t* row, const block
     }
 }
 
+// ---------------------------------------------------------------- RPW row dots (decode-80, 2026-10-10)
+// row_dot_80_sub16 / row_dot_20_sub16 with RPW rows per 16-lane sub-warp.  Each row keeps the original's exact
+// chunk->lane mapping and addition tree (bitwise the same values per row); the RPW rows' weight loads interleave
+// for memory-level parallelism.  Wired by STRATA_GU_RPW / STRATA_DOWN_RPW (0 = off, 2/4 = rows per sub-warp).
+
+template<int TY, int NC, bool EXACT_N = false, bool STAGE_GRID = false, int RPW = 2>
+__device__ __forceinline__ void row_dot_80_sub16_rpw(const uint8_t* const (&rows)[RPW], const block_q8_1* x,
+                                                     const int (&off)[NC], int n, int t, float (&s)[RPW][NC],
+                                                     const uint32_t* __restrict__ s_grid = nullptr) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    float s16[RPW][NC];
+#pragma unroll
+    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) { s[q][c] = 0.0f; s16[q][c] = 0.0f; }
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {   // k = t, t+32, t+64: row_dot_80_sub16's first group, same order
+        const int k = t + 32 * i;
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) w[q] = S::template load<STAGE_GRID>(rows[q], kbx, iqs, s_grid);
+#pragma unroll
+        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s[q][c] += S::apply(w[q], x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {   // k = t+16, t+48: its second group
+        const int k = t + 16 + 32 * i;
+        const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) w[q] = S::template load<STAGE_GRID>(rows[q], kbx, iqs, s_grid);
+#pragma unroll
+        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s16[q][c] += S::apply(w[q], x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (EXACT_N || c < n) {
+                s[q][c] = __fadd_rn(s[q][c], s16[q][c]);
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) s[q][c] += __shfl_xor_sync(0xffffffffu, s[q][c], o);
+            }
+        }
+}
+
+template<int TY, int NC, bool EXACT_N = false, int RPW = 2>
+__device__ __forceinline__ void row_dot_20_sub16_rpw(const uint8_t* const (&rows)[RPW], const block_q8_1* x,
+                                                     const int (&off)[NC], int n, int t, float (&s)[RPW][NC]) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    float s16[RPW][NC];
+#pragma unroll
+    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) { s[q][c] = 0.0f; s16[q][c] = 0.0f; }
+    {
+        const int k = t, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) w[q] = S::load(rows[q], kbx, iqs);
+#pragma unroll
+        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s[q][c] += S::apply(w[q], x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+    if (t < 4) {
+        const int k = t + 16, kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+        typename S::W w[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) w[q] = S::load(rows[q], kbx, iqs);
+#pragma unroll
+        for (int q = 0; q < RPW; ++q)
+#pragma unroll
+            for (int c = 0; c < NC; ++c)
+                if (EXACT_N || c < n) s16[q][c] += S::apply(w[q], x + off[c] + kbx * (F::qk / 32), iqs);
+    }
+#pragma unroll
+    for (int q = 0; q < RPW; ++q)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            if (EXACT_N || c < n) {
+                s[q][c] = __fadd_rn(s[q][c], s16[q][c]);
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) s[q][c] += __shfl_xor_sync(0xffffffffu, s[q][c], o);
+            }
+        }
+}
+
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
 __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int tid, int nthreads) {
     if constexpr (!STAGE_GRID) {
@@ -1509,6 +1607,145 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
 #pragma unroll
                 for (int c = 0; c < GRP_NC; ++c)
                     if (c < n && lane == c) out[(size_t) ent_dst[e + c] * L.n_embd + r] = s[c];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- RPW grouped experts (decode-80)
+// native_gu_multi_kernel's SUB16 arm with RPW rows per 16-lane sub-warp (row_dot_80_sub16_rpw).  Requires
+// n_embd == 2560 and (2*n_ff) % (16*RPW) == 0; results are bitwise the multi kernel's, row for row.
+template<int TG, bool STAGE_GRID = kStageIqGrid<TG>, int RPW = 2>
+__global__ void __launch_bounds__(256) native_gu_rpw_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_tok,
+                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                            float* __restrict__ gate, float* __restrict__ up) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, IqGridWords<TG, STAGE_GRID>::value);
+    const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
+    const int subwarp = threadIdx.x >> 4, t = threadIdx.x & 15;
+    const int row = blockIdx.x * (16 * RPW) + subwarp;      // this sub-warp covers rows row + 16*q
+    if (row >= 2 * L.n_ff) return;
+    size_t woff[RPW];
+    int rr[RPW];
+    bool upq[RPW];
+#pragma unroll
+    for (int q = 0; q < RPW; ++q) {
+        const int rq = row + 16 * q;
+        upq[q] = rq >= L.n_ff;
+        rr[q] = upq[q] ? rq - (int) L.n_ff : rq;
+        woff[q] = (upq[q] ? L.up_off : 0) + (size_t) rr[q] * L.gu_row;
+    }
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* rows[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) rows[q] = (const uint8_t*) grp_ptr[g] + woff[q];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            if (n == 1) {
+                const int off1[1] = { ent_tok[e] * 80 };
+                float s1[RPW][1];
+                row_dot_80_sub16_rpw<TG, 1, true, STAGE_GRID, RPW>(rows, xq, off1, 1, t, s1, s_grid);
+                if (t == 0)
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) (upq[q] ? up : gate)[(size_t) e * L.n_ff + rr[q]] = s1[q][0];
+            } else if (n == 2) {
+                const int off2[2] = { ent_tok[e] * 80, ent_tok[e + 1] * 80 };
+                float s2[RPW][2];
+                row_dot_80_sub16_rpw<TG, 2, true, STAGE_GRID, RPW>(rows, xq, off2, 2, t, s2, s_grid);
+                if (t < 2)
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) (upq[q] ? up : gate)[(size_t) (e + t) * L.n_ff + rr[q]] = s2[q][t];
+            } else if (n == 3) {
+                const int off3[3] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80 };
+                float s3[RPW][3];
+                row_dot_80_sub16_rpw<TG, 3, true, STAGE_GRID, RPW>(rows, xq, off3, 3, t, s3, s_grid);
+                if (t < 3)
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) (upq[q] ? up : gate)[(size_t) (e + t) * L.n_ff + rr[q]] = s3[q][t];
+            } else {
+                const int off4[4] = { ent_tok[e] * 80, ent_tok[e + 1] * 80, ent_tok[e + 2] * 80, ent_tok[e + 3] * 80 };
+                float s4[RPW][4];
+                row_dot_80_sub16_rpw<TG, 4, true, STAGE_GRID, RPW>(rows, xq, off4, 4, t, s4, s_grid);
+                if (t < 4)
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q) (upq[q] ? up : gate)[(size_t) (e + t) * L.n_ff + rr[q]] = s4[q][t];
+            }
+        }
+    }
+}
+
+// native_down_multi_kernel's TD == 42 arm with RPW rows per 16-lane sub-warp (row_dot_20_sub16_rpw).  Requires
+// n_ff == 640 (hb == 20) and n_embd % (16*RPW) == 0; results are bitwise the multi kernel's, row for row.
+template<int TD, int RPW = 2>
+__global__ void __launch_bounds__(256) native_down_rpw_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_dst,
+                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                              float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
+    const int subwarp = threadIdx.x >> 4, t = threadIdx.x & 15;
+    const int r = blockIdx.x * (16 * RPW) + subwarp;        // this sub-warp covers rows r + 16*q
+    const bool valid_r = (r < L.n_embd);
+    size_t woff[RPW];
+    int rr[RPW];
+    bool rqok[RPW];
+#pragma unroll
+    for (int q = 0; q < RPW; ++q) {
+        rqok[q] = r + 16 * q < L.n_embd;
+        rr[q] = rqok[q] ? r + 16 * q : 0;
+        woff[q] = (size_t) rr[q] * L.d_row;
+    }
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* rows[RPW];
+#pragma unroll
+        for (int q = 0; q < RPW; ++q) rows[q] = (const uint8_t*) grp_ptr[g] + L.down_off + woff[q];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20);
+            const int words = n * (20 * 9);
+            __syncthreads();
+            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+            __syncthreads();
+            if (valid_r) {
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[RPW][1];
+                    row_dot_20_sub16_rpw<TD, 1, true, RPW>(rows, s_hq, off1, 1, t, s1);
+                    if (t == 0)
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) if (rqok[q]) out[(size_t) ent_dst[e] * L.n_embd + rr[q]] = s1[q][0];
+                } else if (n == 2) {
+                    const int off2[2] = { 0, 20 };
+                    float s2[RPW][2];
+                    row_dot_20_sub16_rpw<TD, 2, true, RPW>(rows, s_hq, off2, 2, t, s2);
+                    if (t < 2)
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) if (rqok[q]) out[(size_t) ent_dst[e + t] * L.n_embd + rr[q]] = s2[q][t];
+                } else if (n == 3) {
+                    const int off3[3] = { 0, 20, 40 };
+                    float s3[RPW][3];
+                    row_dot_20_sub16_rpw<TD, 3, true, RPW>(rows, s_hq, off3, 3, t, s3);
+                    if (t < 3)
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) if (rqok[q]) out[(size_t) ent_dst[e + t] * L.n_embd + rr[q]] = s3[q][t];
+                } else {
+                    const int off4[4] = { 0, 20, 40, 60 };
+                    float s4[RPW][4];
+                    row_dot_20_sub16_rpw<TD, 4, true, RPW>(rows, s_hq, off4, 4, t, s4);
+                    if (t < 4)
+#pragma unroll
+                        for (int q = 0; q < RPW; ++q) if (rqok[q]) out[(size_t) ent_dst[e + t] * L.n_embd + rr[q]] = s4[q][t];
+                }
             }
         }
     }
@@ -2662,12 +2899,38 @@ void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cud
     else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
 }
 
+// STRATA_GU_RPW / STRATA_DOWN_RPW (decode-80): rows per 16-lane sub-warp in the RPW kernels (0 = off).
+int gu_rpw_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_GU_RPW"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+int down_rpw_mode() {
+    static const int m = [] { const char* v = std::getenv("STRATA_DOWN_RPW"); return v ? std::atoi(v) : 0; }();
+    return m;
+}
+
 template<int TG>
 void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
                float* gate, float* up) {
     if constexpr (!kSplit<TG>) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
     else if (g_old_kernels) native_gu_kernel<TG><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    // RPW pays for the 2-bit i-quant gate/up on gfx1151 (native_expert_bench: IQ2_S/IQ2_XXS faster; the 3-bit
+    // formats and IQ1_M/IQ4_XS spill registers and lose); the down RPW wins for every split type.
+    else if ((gu_rpw_mode() == 2 || gu_rpw_mode() == 4) && (TG == 16 || TG == 17 || TG == 22) && L.n_embd == 2560 &&
+             (2 * L.n_ff) % (16 * gu_rpw_mode()) == 0) {
+        const int rpw = gu_rpw_mode();
+        const dim3 g2((unsigned) (2 * L.n_ff / (16 * rpw)), grid.y);
+        if constexpr (kStageIqGrid<TG>) {
+            if (g_stage_grid) {
+                if (rpw == 2) native_gu_rpw_kernel<TG, true, 2><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                else native_gu_rpw_kernel<TG, true, 4><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                return;
+            }
+        }
+        if (rpw == 2) native_gu_rpw_kernel<TG, false, 2><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+        else native_gu_rpw_kernel<TG, false, 4><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+    }
     else if constexpr (kStageIqGrid<TG>) {
         if (!g_stage_grid) {
             if (g_no_sub16_gu) native_gu_multi_kernel<TG, false, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
@@ -2688,6 +2951,16 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
                  float* out) {
     if constexpr (!kSplit<TD>) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else if (g_old_kernels) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    // RPW down is wired for the K == 20 row dot only (row_dot_20_sub16_rpw): TD == 42.  TD == 20 (IQ4_NL) needs
+    // the K == 40 tree (row_dot_40_sub8); running the K == 20 clone there drops half the row (caught by the
+    // engine-level logits cosine gate, 2026-10-10).
+    else if ((down_rpw_mode() == 2 || down_rpw_mode() == 4) && TD == 42 && L.n_ff == 640 &&
+             L.n_embd % (16 * down_rpw_mode()) == 0) {
+        const int rpw = down_rpw_mode();
+        const dim3 g2((unsigned) (L.n_embd / (16 * rpw)), grid.y);
+        if (rpw == 2) native_down_rpw_kernel<TD, 2><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        else native_down_rpw_kernel<TD, 4><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    }
     else if (g_no_sub16_gu) native_down_multi_kernel<TD, false><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     else native_down_multi_kernel<TD, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
 }

@@ -56,8 +56,10 @@
   "STRATA_PA_FAST": "1",
   "STRATA_HIP_WMMA": "1",
   "STRATA_SELECT_WMMA": "1",
-  "STRATA_HC_Q8": "1",
-  "STRATA_PF_SWITCH_MIN_T": "4096"
+  "STRATA_HC_Q8": "0",
+  "STRATA_PF_SWITCH_MIN_T": "4096",
+  "STRATA_GU_RPW": "2",
+  "STRATA_DOWN_RPW": "2"
  },
  "open_browser": false
 }
