@@ -1,0 +1,37 @@
+task: >
+  Read-only state check after an interrupted preflight: report whether the
+  production server (8090), the measurement server (8101), and leftover probe
+  processes are alive. Changes nothing.
+
+setup:
+  repo:
+    path: .
+    editable: ["strata-iq3_s.json"]
+
+stages:
+  - name: check
+    task: Report the machine state. No optimization.
+    measure:
+      - name: state
+        version: 1
+        run: "python3 bench/state_check.py"
+        timeout_s: 120
+        reports:
+          prod_8090_up: {unit: flag, means: 1 when production answers on 8090}
+          meas_8101_up: {unit: flag, means: 1 when a measurement server answers on 8101}
+          probe_procs: {unit: count, means: decode_bench.py processes alive}
+          engine_procs: {unit: count, means: engine/strata processes alive}
+          server_py_procs: {unit: count, means: serve/server.py processes alive}
+    constraints:
+      - bound: "prod_8090_up >= 0"
+        on_violation: warn
+        holds: stage
+        why: placeholder warning bound so the stage has a declared grader
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 5}
+budget: {max_usd: 1, max_wall_seconds: 1800, on_limit: pause}
+delivery: {mode: local, approval: required}
