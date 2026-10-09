@@ -6,7 +6,8 @@ streaming generation per boot, and reports median decode_tps and prefill_tps.
 
 GPU exclusivity: stops the production `strata.service` (port 8090) before
 measuring and ALWAYS restarts it afterwards (finally block), verifying it
-answers /v1/models again on 8090.
+answers /v1/models again on 8090. SIGTERM/SIGINT/SIGHUP raise SystemExit so a
+killed probe still lands in the finally block and production comes back.
 
 Protocol (EVO probe):
   - exit 0 + JSON = a reading (zeros included: a candidate that cannot boot is
@@ -19,6 +20,7 @@ Protocol (EVO probe):
 from __future__ import annotations
 
 import json
+import signal
 import statistics
 import subprocess
 import sys
@@ -102,12 +104,39 @@ def port_closed(port: int) -> bool:
     return http_json(f"http://127.0.0.1:{port}/v1/models", timeout=5.0) is None
 
 
+def procs(pattern: str) -> int:
+    r = run_cmd(["pgrep", "-f", pattern], timeout=10)
+    if r is None or r.returncode != 0:
+        return 0
+    return len([ln for ln in (r.stdout or "").splitlines() if ln.strip()])
+
+
+def wait_no_engine(deadline_s: float = 120.0) -> None:
+    t0 = time.time()
+    while time.time() - t0 < deadline_s:
+        if procs("engine/strata") == 0:
+            return
+        time.sleep(5)
+
+
+def cleanup_leftovers() -> None:
+    """A previous interrupted probe may have left its measurement stack alive."""
+    if procs("bench/tmp/spec-boot"):
+        run_cmd(["pkill", "-f", "bench/tmp/spec-boot"], timeout=15)
+        time.sleep(5)
+    # production is already stopped at this point: any engine/strata still alive
+    # is a leftover from a measurement boot, safe to kill.
+    if port_closed(PROD_PORT) and procs("engine/strata"):
+        run_cmd(["pkill", "-f", "engine/strata"], timeout=15)
+        time.sleep(5)
+    wait_no_engine(deadline_s=120.0)
+
+
 def wait_gpu_free(deadline_s: float = 180.0) -> None:
     """Wait until no strata engine process and (best effort) GPU util settles."""
     t0 = time.time()
     while time.time() - t0 < deadline_s:
-        r = run_cmd(["pgrep", "-f", "engine/strata"], timeout=10)
-        if (r is None or r.returncode != 0) and port_closed(PROD_PORT):
+        if procs("engine/strata") == 0 and port_closed(PROD_PORT):
             break
         time.sleep(5)
     for smi in ("rocm-smi", "/opt/rocm/bin/rocm-smi"):
@@ -147,10 +176,12 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout_s: float) -> bool:
     t0 = time.time()
     while time.time() - t0 < timeout_s:
         if proc.poll() is not None:
+            print(f"boot on {port}: server exited early (rc={proc.returncode})", file=sys.stderr)
             return False
         if http_json(f"http://127.0.0.1:{port}/v1/models", timeout=5.0) is not None:
             return True
         time.sleep(5)
+    print(f"boot on {port}: not ready within {timeout_s}s", file=sys.stderr)
     return False
 
 
@@ -200,9 +231,12 @@ def generate_once(port: int, model: str) -> dict | None:
                         t_last = now
                     if ch.get("finish_reason"):
                         t_last = now
-    except Exception:
+    except Exception as exc:
+        print(f"generation on {port} failed: {exc!r}", file=sys.stderr)
         return None
     if t_first is None or t_last is None or t_last <= t_first:
+        print(f"generation on {port}: stream ended without usable tokens "
+              f"(chunks={chunks}, t_first={t_first}, t_last={t_last})", file=sys.stderr)
         return None
     completion = int((usage or {}).get("completion_tokens") or chunks)
     prompt_tokens = (usage or {}).get("prompt_tokens")
@@ -245,11 +279,21 @@ def boot_and_measure(idx: int, model: str) -> dict | None:
             except Exception:
                 pass
         logf.close()
-        # let the engine release the GPU before the next boot
+        # let the engine exit and release the GPU before the next boot
+        wait_no_engine(deadline_s=120.0)
         time.sleep(20)
 
 
 def main() -> int:
+    def _on_signal(sig, _frame):
+        raise SystemExit(128 + sig)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(_sig, _on_signal)
+        except Exception:
+            pass
+
     TMP.mkdir(parents=True, exist_ok=True)
     metrics = {k: 0.0 for k in KEYS}
     instrument_error = None
@@ -267,6 +311,7 @@ def main() -> int:
     if not service_ctl("stop"):
         instrument_error = "could not stop strata.service (no working systemctl path)"
     if instrument_error is None:
+        cleanup_leftovers()
         wait_gpu_free()
 
     results = []
