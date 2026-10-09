@@ -2,8 +2,19 @@
 
 Builds on bench/decode_bench.py (the library that owns the boot/stop/restore
 machinery and the HTTP generation helper) but owns the main loop so the
-completion policy matches what the model really does:
+completion policy and the path discipline match how EVO runs measure:
 
+Path discipline (preflight runs in the real repo; a RUN measures a git worktree
+under ~/.evo/runs/... that contains COMMITTED files only):
+- The candidate spec is the worktree's spec/strata-iq3_s.json — a committed
+  copy of the production config, the file the worker edits. (The production
+  /strata-iq3_s.json at the repo root is gitignored on purpose.)
+- Everything else — .venv python, serve/server.py, the engine binary, model
+  packs, tuning tables — comes from the REAL repo at REAL_REPO: the JSON names
+  all of them by absolute path, so booting the production stack unchanged with
+  the candidate JSON measures exactly the candidate's effect.
+
+Completion policy:
 - Requests 1024 tokens (a request for less than ~that can make this server
   finish immediately with zero content — observed with max_tokens=512).
 - Under greedy decoding the model emits its natural stop at ~902 tokens, so a
@@ -11,10 +22,8 @@ completion policy matches what the model really does:
   completed (DONE / finish_reason) with completion_tokens >= MIN_COMPLETION
   (512) — enough decoded tokens for a stable rate.
 
-Everything else — 3 cold boots of strata-iq3_s.json on port 8101, production
-strata.service stopped before measuring and ALWAYS restored after (finally
-block), median decode/prefill TPS over the completed runs — follows
-decode_bench.py's protocol and helpers.
+GPU exclusivity: production strata.service is stopped before measuring and
+ALWAYS restored after (finally block), exactly as decode_bench.py documents.
 """
 
 from __future__ import annotations
@@ -31,6 +40,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import decode_bench as db  # noqa: E402
 
 MIN_COMPLETION = 512  # tokens; below the model's ~902-token natural stop
+
+WORKTREE = Path(__file__).resolve().parents[1]
+REAL_REPO = Path("/home/chihmin/src/Strata")
+
+# Candidate = the tree being measured (worktree in a run, real repo in preflight).
+db.SPEC_PATH = WORKTREE / "spec" / "strata-iq3_s.json"
+db.TMP = WORKTREE / "bench" / "tmp"
+# Runtime stack = the real repo (its .venv and engine exist only there).
+db.PYTHON = REAL_REPO / ".venv" / "bin" / "python"
+db.REPO = REAL_REPO
 
 
 def main() -> int:

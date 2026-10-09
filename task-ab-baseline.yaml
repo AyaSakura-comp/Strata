@@ -1,14 +1,15 @@
 task: >
   Baseline only: measure the UNCHANGED tree with bench/ab_bench.py (the A/B
   GPU-exclusive protocol: production strata.service stopped, 3 cold boots of
-  strata-iq3_s.json on port 8101, one streamed 1024-token-request generation
-  per boot, production restored afterwards). Change nothing. The run's reading
-  sets the authoritative prefill floor for the decode-80 optimization task.
+  the production stack with the candidate spec/strata-iq3_s.json on port 8101,
+  one streamed 1024-token-request generation per boot, production restored
+  afterwards). Change nothing. The run's reading sets the authoritative
+  prefill floor for the decode-80 optimization task.
 
 setup:
   repo:
     path: .
-    editable: ["strata-iq3_s.json"]
+    editable: ["spec/strata-iq3_s.json"]
 
 stages:
   - name: baseline
