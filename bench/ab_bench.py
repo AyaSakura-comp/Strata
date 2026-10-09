@@ -1,8 +1,9 @@
 """bench/ab_bench.py — the actual A/B GPU-exclusive probe for the decode-80 run.
 
 Builds on bench/decode_bench.py (the library that owns the boot/stop/restore
-machinery and the HTTP generation helper) but owns the main loop so the
-completion policy and the path discipline match how EVO runs measure:
+machinery, the HTTP generation helper and the engine-log parsing) but owns the
+main loop so the completion policy and the path discipline match how EVO runs
+measure.
 
 Path discipline (preflight runs in the real repo; a RUN measures a git worktree
 under ~/.evo/runs/... that contains COMMITTED files only):
@@ -14,6 +15,15 @@ under ~/.evo/runs/... that contains COMMITTED files only):
   all of them by absolute path, so booting the production stack unchanged with
   the candidate JSON measures exactly the candidate's effect.
 
+Metric definitions (all reported per reading, median + worst of the boots):
+- prefill_tps_engine / decode_tps_engine — the ENGINE's own rates, parsed from
+  the per-boot engine log's per-request summary line. prefill = 1000 *
+  fresh_tokens / prompt_ms (cache-reused prompt tokens excluded, no HTTP or
+  queueing latency). This is the authoritative prefill gate for the run.
+- prefill_tps / decode_tps — the client view from stream timings (prefill =
+  prompt_tokens / TTFT, so connection, queueing and the first decoded token are
+  included). Kept as an end-to-end reference only.
+
 Completion policy:
 - Requests 1024 tokens (a request for less than ~that can make this server
   finish immediately with zero content — observed with max_tokens=512).
@@ -24,13 +34,14 @@ Completion policy:
 
 GPU exclusivity: production strata.service is stopped before measuring and
 ALWAYS restored after (finally block), exactly as decode_bench.py documents.
+A GPU that never goes idle after the stop is an instrument failure, not a
+(contended) reading.
 """
 
 from __future__ import annotations
 
 import json
 import signal
-import statistics
 import sys
 import time
 from pathlib import Path
@@ -80,7 +91,8 @@ def main() -> int:
         instrument_error = "could not stop strata.service (no working systemctl path)"
     if instrument_error is None:
         db.cleanup_leftovers()
-        db.wait_gpu_free()
+        if not db.wait_gpu_free():
+            instrument_error = "GPU never went idle after stopping production"
 
     results = []
     try:
@@ -105,14 +117,7 @@ def main() -> int:
             instrument_error = instrument_error or "production restore failed"
 
     if results:
-        dec = [r["decode_tps"] for r in results]
-        pf = [r["prefill_tps"] for r in results]
-        metrics["decode_tps"] = statistics.median(dec)
-        metrics["prefill_tps"] = statistics.median(pf)
-        metrics["decode_tps_min"] = min(dec)
-        metrics["prefill_tps_min"] = min(pf)
-        metrics["prompt_tokens"] = results[0]["prompt_tokens"]
-        metrics["prompt_tokens_estimated"] = results[0]["estimated"]
+        db.aggregate(metrics, results)
     metrics["runs_complete"] = len(results) / db.BOOTS
 
     db.emit(metrics)
