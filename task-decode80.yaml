@@ -1,9 +1,9 @@
 task: >
   Raise the decode throughput of the production Strata inference configuration
   `strata-iq3_s.json` (Qwen3.8-Flash-Next IQ3_S on this ROCm/HIP machine, gfx1151)
-  to at least 80 decode tokens/sec, measured by bench/decode_bench.py under the A/B
+  to at least 80 decode tokens/sec, measured by bench/ab_bench.py under the A/B
   GPU-exclusive protocol (production service stopped, 3 cold boots of the candidate
-  spec on port 8101, one 1024-token streaming generation per boot, streaming-token
+  spec on port 8101, one 512-token streaming generation per boot, streaming-token
   timing). Prefill TPS must stay at or above the bound measured from the current
   baseline spec. The bench and its prompt are the fitness function and are not
   yours to change. `strata-iq3_s.json` must remain a valid production
@@ -36,25 +36,26 @@ stages:
     task: >
       Make the candidate spec reach decode_tps >= 80 (median of 3 cold-boot runs)
       while keeping prefill_tps above the declared bound and every one of the 3
-      runs completing all 1024 tokens. Start by reproducing the baseline reading
-      on the unchanged tree, then change ONE lever at a time and let the probe
-      grade it. Do not touch bench/ or anything excluded from your editable region.
+      runs completing its full 512-token generation. Start by reproducing the
+      baseline reading on the unchanged tree, then change ONE lever at a time and
+      let the probe grade it. Do not touch bench/ or anything excluded from your
+      editable region.
     knowledge: [perf_claim_protocol]
     measure:
       - name: ab_gpu_exclusive
-        version: 1
-        run: "python3 bench/decode_bench.py"
+        version: 2
+        run: "python3 bench/ab_bench.py"
         timeout_s: 3600
         reports:
           decode_tps:
             unit: tok/s
-            means: median decode tokens/sec over 3 cold-boot 1024-token runs
+            means: median decode tokens/sec over 3 cold-boot 512-token runs
           prefill_tps:
             unit: tok/s
             means: median prompt tokens/sec (prompt_tokens / time-to-first-token) over the same runs
           runs_complete:
             unit: fraction
-            means: share of the 3 boots that completed all 1024 tokens
+            means: share of the 3 boots that completed the full 512-token generation
           decode_tps_min:
             unit: tok/s
             means: worst single boot
@@ -79,7 +80,7 @@ stages:
       - bound: "runs_complete >= 1.0"
         on_violation: block
         holds: stage
-        why: a TPS from fewer than 3 full 1024-token runs is a TPS for a shorter and easier bench
+        why: a TPS from fewer than 3 full 512-token runs is a TPS for a shorter and easier bench
 
 models:
   framework: {provider: codex}

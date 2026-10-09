@@ -1,0 +1,55 @@
+task: >
+  Read-only baseline: time one 512-token streaming generation with the exact
+  bench prompt against the PRODUCTION server on port 8090 (the unchanged
+  strata-iq3_s.json, warm and resident). Stops nothing. The numbers are a warm
+  reference for the prefill floor in the decode-80 optimization task; the
+  authoritative floor comes from the same A/B cold-boot protocol.
+
+setup:
+  repo:
+    path: .
+    editable: ["strata-iq3_s.json"]
+
+stages:
+  - name: baseline
+    task: Report production baseline TPS. No optimization.
+    measure:
+      - name: prod_baseline
+        version: 2
+        run: "python3 bench/baseline_probe.py"
+        timeout_s: 300
+        reports:
+          decode_tps:
+            unit: tok/s
+            means: decode tokens/sec measured on the production server
+          prefill_tps:
+            unit: tok/s
+            means: prompt tokens / time-to-first-token
+          completion_tokens:
+            unit: count
+            means: tokens produced (reported by usage or counted chunks)
+          prompt_tokens:
+            unit: count
+            means: prompt tokens (reported or chars/4 estimate)
+          prompt_tokens_estimated:
+            unit: flag
+            means: 1 when prompt_tokens is an estimate
+          ttft_s:
+            unit: s
+            means: request start to first content token
+          gen_s:
+            unit: s
+            means: first to last content token
+    constraints:
+      - bound: "decode_tps >= 0"
+        on_violation: warn
+        holds: stage
+        why: placeholder warning bound so the stage has a declared grader
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 5}
+budget: {max_usd: 1, max_wall_seconds: 1800, on_limit: pause}
+delivery: {mode: local, approval: required}
