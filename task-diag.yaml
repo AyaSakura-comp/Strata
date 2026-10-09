@@ -1,0 +1,44 @@
+task: >
+  Read-only HTTP diagnostic against the production server on 8090: replay the
+  exact baseline request (bench prompt, 1024 max_tokens, streamed with
+  stream_options) and report every interior detail of the exchange so the
+  operator can see why the baseline probe's reading fails. Changes nothing.
+
+setup:
+  repo:
+    path: .
+    editable: ["strata-iq3_s.json"]
+
+stages:
+  - name: diag
+    task: Report production HTTP behaviour. No optimization.
+    measure:
+      - name: http_diag
+        version: 2
+        run: "python3 bench/diag_probe.py"
+        timeout_s: 900
+        reports:
+          http_status: {unit: code, means: "HTTP status of the streaming POST (-1 transport error)"}
+          got_done: {unit: flag, means: "1 if the stream delivered the DONE marker"}
+          chunks: {unit: count, means: "SSE chunks carrying content"}
+          completion_tokens: {unit: count, means: "usage.completion_tokens (0 if no usage)"}
+          prompt_tokens: {unit: count, means: "usage.prompt_tokens (0 if no usage)"}
+          usage_present: {unit: flag, means: "1 if any usage object arrived"}
+          finish_stop: {unit: flag, means: "1 if finish_reason stop seen"}
+          finish_length: {unit: flag, means: "1 if finish_reason length seen"}
+          ttft_s: {unit: s, means: "request start to first content token"}
+          gen_s: {unit: s, means: "first to last content token"}
+          content_chars: {unit: count, means: "characters of generated content"}
+    constraints:
+      - bound: "http_status >= -1"
+        on_violation: warn
+        holds: stage
+        why: placeholder warning bound so the stage has a declared grader
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 5}
+budget: {max_usd: 1, max_wall_seconds: 1800, on_limit: pause}
+delivery: {mode: local, approval: required}
