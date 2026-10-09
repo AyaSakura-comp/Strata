@@ -14,6 +14,12 @@ under ~/.evo/runs/... that contains COMMITTED files only):
   packs, tuning tables — comes from the REAL repo at REAL_REPO: the JSON names
   all of them by absolute path, so booting the production stack unchanged with
   the candidate JSON measures exactly the candidate's effect.
+- ALL probe artifacts (spec-boot<N>.json copies, server/engine logs, live
+  state) go to the REAL repo's bench/tmp, NEVER the measured worktree: an
+  untracked file appearing in the worktree outside the editable region makes
+  the framework refuse the round as region_violated (observed on this run:
+  the spec-boot<N>.json copies written by a bench invocation from inside the
+  worktree refused two consecutive rounds).
 
 Metric definitions (all reported per reading, median + worst of the boots):
 - prefill_tps_engine / decode_tps_engine — the ENGINE's own rates, parsed from
@@ -57,7 +63,9 @@ REAL_REPO = Path("/home/chihmin/src/Strata")
 
 # Candidate = the tree being measured (worktree in a run, real repo in preflight).
 db.SPEC_PATH = WORKTREE / "spec" / "strata-iq3_s.json"
-db.TMP = WORKTREE / "bench" / "tmp"
+# Artifacts = the REAL repo, always. Writing them into the measured worktree
+# shows up as an out-of-region tree change and the round is refused.
+db.TMP = REAL_REPO / "bench" / "tmp"
 # Runtime stack = the real repo (its .venv and engine exist only there).
 db.PYTHON = REAL_REPO / ".venv" / "bin" / "python"
 db.REPO = REAL_REPO
