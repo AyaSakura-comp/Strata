@@ -16,7 +16,7 @@
   "--spec",
   "4",
   "--spec-min-p",
-  "0.5",
+  "0.3",
   "--mtp",
   "/home/chihmin/src/Strata-data/mtp/rt",
   "--max-context",
@@ -34,7 +34,9 @@
   "--cvec-mode",
   "project",
   "--cvec-dir",
-  "per-layer"
+  "per-layer",
+  "--mtp-hnorm",
+  "stream"
  ],
  "cwd": "/home/chihmin/src/Strata",
  "tokenizer": "/home/chihmin/src/Strata-data/packs/iq3_s/tokenizer",
