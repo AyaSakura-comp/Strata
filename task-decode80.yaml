@@ -1,0 +1,92 @@
+task: >
+  Raise the decode throughput of the production Strata inference configuration
+  `strata-iq3_s.json` (Qwen3.8-Flash-Next IQ3_S on this ROCm/HIP machine, gfx1151)
+  to at least 80 decode tokens/sec, measured by bench/decode_bench.py under the A/B
+  GPU-exclusive protocol (production service stopped, 3 cold boots of the candidate
+  spec on port 8101, one 1024-token streaming generation per boot, streaming-token
+  timing). Prefill TPS must stay at or above the bound measured from the current
+  baseline spec. The bench and its prompt are the fitness function and are not
+  yours to change. `strata-iq3_s.json` must remain a valid production
+  configuration of the same model (same pack/native/ple/mtp paths); only
+  performance-relevant args and env may change. Known levers, from the author's
+  own experiments: `--spec`, `--spec-min-p`, `--lookup-chain`, `--mtp-q4`,
+  `--prefill`, `--kv-resident`, the STRATA_* env flags, the hipblaslt tuning table,
+  and the engine source under src/ / serve/.
+
+setup:
+  repo:
+    path: .
+    editable:
+      - "strata-iq3_s.json"
+      - "src/**"
+      - "include/**"
+      - "engine/**"
+      - "third_party/**"
+      - "tools/**"
+      - "serve/**"
+      - "data/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "build-hip/**"
+      - "!bench/**"
+      - "!.venv/**"
+
+stages:
+  - name: decode-80
+    task: >
+      Make the candidate spec reach decode_tps >= 80 (median of 3 cold-boot runs)
+      while keeping prefill_tps above the declared bound and every one of the 3
+      runs completing all 1024 tokens. Start by reproducing the baseline reading
+      on the unchanged tree, then change ONE lever at a time and let the probe
+      grade it. Do not touch bench/ or anything excluded from your editable region.
+    knowledge: [perf_claim_protocol]
+    measure:
+      - name: ab_gpu_exclusive
+        version: 1
+        run: "python3 bench/decode_bench.py"
+        timeout_s: 3600
+        reports:
+          decode_tps:
+            unit: tok/s
+            means: median decode tokens/sec over 3 cold-boot 1024-token runs
+          prefill_tps:
+            unit: tok/s
+            means: median prompt tokens/sec (prompt_tokens / time-to-first-token) over the same runs
+          runs_complete:
+            unit: fraction
+            means: share of the 3 boots that completed all 1024 tokens
+          decode_tps_min:
+            unit: tok/s
+            means: worst single boot
+          prefill_tps_min:
+            unit: tok/s
+            means: worst single boot
+          prompt_tokens:
+            unit: count
+            means: prompt tokens per request (reported or chars/4 estimate)
+          prompt_tokens_estimated:
+            unit: flag
+            means: 1 when prompt_tokens is a chars/4 estimate
+    constraints:
+      - bound: "decode_tps >= 80"
+        on_violation: block
+        holds: stage
+        why: decode TPS above 80 is the declared goal of this run
+      - bound: "prefill_tps >= 1"
+        on_violation: block
+        holds: stage
+        why: prefill must not regress below the baseline spec's prefill TPS; the exact bound is filled in from the measured baseline before launch
+      - bound: "runs_complete >= 1.0"
+        on_violation: block
+        holds: stage
+        why: a TPS from fewer than 3 full 1024-token runs is a TPS for a shorter and easier bench
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 40}
+
+budget: {max_usd: 10, max_wall_seconds: 21600, on_limit: pause}
+
+delivery: {mode: local, approval: required}
