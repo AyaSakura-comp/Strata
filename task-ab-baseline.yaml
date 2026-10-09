@@ -1,0 +1,57 @@
+task: >
+  Baseline only: measure the UNCHANGED tree with bench/ab_bench.py (the A/B
+  GPU-exclusive protocol: production strata.service stopped, 3 cold boots of
+  strata-iq3_s.json on port 8101, one streamed 1024-token-request generation
+  per boot, production restored afterwards). Change nothing. The run's reading
+  sets the authoritative prefill floor for the decode-80 optimization task.
+
+setup:
+  repo:
+    path: .
+    editable: ["strata-iq3_s.json"]
+
+stages:
+  - name: baseline
+    task: >
+      Report the A/B cold-boot baseline reading of the unchanged tree. Do not
+      modify any file; the number is what matters.
+    measure:
+      - name: ab_gpu_exclusive_baseline
+        version: 2
+        run: "python3 bench/ab_bench.py"
+        timeout_s: 3600
+        reports:
+          decode_tps:
+            unit: tok/s
+            means: median decode tokens/sec over 3 cold-boot runs
+          prefill_tps:
+            unit: tok/s
+            means: median prompt tokens/sec (prompt_tokens / time-to-first-token) over the same runs
+          runs_complete:
+            unit: fraction
+            means: share of the 3 boots whose generation completed with at least 512 tokens
+          decode_tps_min:
+            unit: tok/s
+            means: worst single boot
+          prefill_tps_min:
+            unit: tok/s
+            means: worst single boot
+          prompt_tokens:
+            unit: count
+            means: prompt tokens per request (reported or chars/4 estimate)
+          prompt_tokens_estimated:
+            unit: flag
+            means: 1 when prompt_tokens is a chars/4 estimate
+    constraints:
+      - bound: "runs_complete >= 0"
+        on_violation: warn
+        holds: stage
+        why: placeholder warning bound so the stage has a declared grader; any reading is a good baseline reading
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 5}
+budget: {max_usd: 1, max_wall_seconds: 5400, on_limit: pause}
+delivery: {mode: local, approval: required}
