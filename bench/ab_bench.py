@@ -1,9 +1,19 @@
-"""bench/ab_bench.py — the actual A/B GPU-exclusive probe for the decode-80 run.
+"""bench/ab_bench.py — the actual A/B GPU-exclusive probe for the prefill-20k / decode-128 run.
 
 Builds on bench/decode_bench.py (the library that owns the boot/stop/restore
 machinery, the HTTP generation helper and the engine-log parsing) but owns the
 main loop so the completion policy and the path discipline match how EVO runs
 measure.
+
+Workload (this run's fitness function):
+- Prompt = decode_bench.BASE repeated 192 times (~52 KB, ~20k tokens; the
+  engine's own fresh-token count is reported as prompt_fresh_tokens).
+- One streamed request per boot with max_tokens = 128 (decode_bench.GEN_TOKENS
+  overridden below, BEFORE any generation happens; decode_bench's functions
+  read these module globals at call time).
+- completion_tokens_median is reported so every reading shows how many tokens
+  the generations actually produced (128 = the declared workload; materially
+  more means the probe is not measuring what the spec declares).
 
 Path discipline (preflight runs in the real repo; a RUN measures a git worktree
 under ~/.evo/runs/... that contains COMMITTED files only):
@@ -35,12 +45,10 @@ Metric definitions (all reported per reading, median + worst of the boots):
   included). Kept as an end-to-end reference only.
 
 Completion policy:
-- Requests 1024 tokens (a request for less than ~that can make this server
-  finish immediately with zero content — observed with max_tokens=512).
-- Under greedy decoding the model emits its natural stop at ~902 tokens, so a
-  run cannot "complete all 1024". A boot therefore counts when its generation
-  completed (DONE / finish_reason) with completion_tokens >= MIN_COMPLETION
-  (512) — enough decoded tokens for a stable rate.
+- Requests 128 tokens per boot.
+- A boot counts when its generation completed (DONE / finish_reason) with
+  completion_tokens >= MIN_COMPLETION (96 = 75% of the request) — enough
+  decoded tokens for a stable rate at this workload.
 
 GPU exclusivity: production strata.service is stopped before measuring and
 ALWAYS restored after (finally block), exactly as decode_bench.py documents.
@@ -52,6 +60,7 @@ from __future__ import annotations
 
 import json
 import signal
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -60,7 +69,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import decode_bench as db  # noqa: E402
 
-MIN_COMPLETION = 512  # tokens; below the model's ~902-token natural stop
+MIN_COMPLETION = 96  # tokens; 75% of the 128-token request
+
+# Workload override for THIS probe (module globals, read at call time by
+# decode_bench's generate_once/payload construction): 128-token generations
+# against a ~20k-token prompt.
+db.GEN_TOKENS = 128
+db.PROMPT = db.BASE * 192  # ~52 KB; ~20k tokens by the engine's own count
+# One extra reported key so a reading proves its own generation length.
+db.KEYS = db.KEYS + ["completion_tokens_median"]
 
 WORKTREE = Path(__file__).resolve().parents[1]
 REAL_REPO = Path("/home/chihmin/src/Strata")
@@ -156,6 +173,9 @@ def main() -> int:
 
     if results:
         db.aggregate(metrics, results)
+        metrics["completion_tokens_median"] = statistics.median(
+            r["completion_tokens"] for r in results
+        )
     metrics["runs_complete"] = len(results) / db.BOOTS
 
     db.emit(metrics)

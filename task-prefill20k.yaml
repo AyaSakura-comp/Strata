@@ -1,0 +1,133 @@
+task: >
+  Raise the decode throughput of the Strata inference configuration
+  `spec/strata-iq3_s.json` (a committed copy of the production strata-iq3_s.json:
+  Qwen3.8-Flash-Next IQ3_S on this ROCm/HIP machine, gfx1151) to at least 80
+  decode tokens/sec by the ENGINE's own definition (generated tokens /
+  generation ms, from the per-request summary line in the engine log), measured
+  by bench/ab_bench.py under the A/B GPU-exclusive protocol with this run's
+  workload: a ~20,000-token FRESH prompt (the paragraph in decode_bench.BASE
+  repeated 192 times) and one streamed 128-token generation per boot, 3 cold
+  boots of the production stack with the candidate JSON on port 8101. Prefill
+  must stay at or above 950 tok/s (engine definition: fresh prompt tokens /
+  prompt read ms, cache reuse excluded). The previous run's figures came from a
+  3,759-token prompt (baseline decode 49.6, prefill ~1000, best found 50.8);
+  on this 20k workload the baseline is UNKNOWN — establish it first with a
+  reading on the unchanged tree, and expect decode to drop because attention
+  now runs over a ~20k-token KV. The bench and its prompt are the fitness
+  function and are not yours to change. Only `spec/strata-iq3_s.json` (its
+  `args` list and `env` map) is editable: the model pack/native/ple/mtp/
+  tokenizer paths must stay the same model; only performance-relevant args and
+  env may change (e.g. `--spec`, `--spec-min-p`, `--prefill`, `--kv-resident`,
+  the STRATA_* env flags, the hipblaslt tuning table path). The probe boots
+  the production engine unchanged, so edits outside the JSON cannot affect the
+  reading. Delivering means landing the tuned candidate JSON on the run's
+  branch; adopting it as the production /strata-iq3_s.json is a separate human
+  step.
+
+setup:
+  repo:
+    path: .
+    editable:
+      - "spec/strata-iq3_s.json"
+
+stages:
+  - name: decode-80
+    task: >
+      Make the candidate spec reach decode_tps_engine >= 80 (median of the
+      cold-boot runs) while keeping prefill_tps_engine >= 950, with at least 2
+      of 3 boots completing a generation of at least 96 of the 128 requested
+      tokens, on the ~20,000-token fresh prompt. Start by reproducing the
+      baseline reading on the unchanged tree (the 20k/128 baseline is not yet
+      measured; report it), then change ONE lever at a time and let the probe
+      grade it. Every reading also reports prompt_fresh_tokens and
+      completion_tokens_median so you can see the workload was the declared
+      one. Do not touch anything outside your editable region (bench/ is the
+      instrument; the machine's real repo tree is the runtime stack).
+    knowledge: [perf_claim_protocol]
+    measure:
+      - name: ab_gpu_exclusive
+        version: 4
+        run: "python3 bench/ab_bench.py"
+        timeout_s: 3600
+        reports:
+          decode_tps_engine:
+            unit: tok/s
+            means: median ENGINE decode tokens/sec (generated tokens / generation ms, from the engine's per-request summary line) over the cold-boot runs
+          decode_tps_engine_min:
+            unit: tok/s
+            means: worst single boot, engine view
+          prefill_tps_engine:
+            unit: tok/s
+            means: median ENGINE prefill tokens/sec (1000 * fresh prompt tokens / prompt read ms, cache reuse excluded) over the same runs
+          prefill_tps_engine_min:
+            unit: tok/s
+            means: worst single boot, engine view
+          engine_lines:
+            unit: count
+            means: how many boots yielded a parsed engine summary line (0..3)
+          prompt_fresh_tokens:
+            unit: count
+            means: prompt tokens actually pre-filled per request (cache reuse excluded), per engine
+          completion_tokens_median:
+            unit: count
+            means: median tokens generated per completed boot; the workload requests 128
+          decode_tps:
+            unit: tok/s
+            means: median client-view decode tokens/sec from stream timings (reference only, not gated)
+          prefill_tps:
+            unit: tok/s
+            means: median client-view prompt tokens/sec (prompt_tokens / time-to-first-token, includes connection and queueing; reference only, not gated)
+          decode_tps_min:
+            unit: tok/s
+            means: worst single boot, client view
+          prefill_tps_min:
+            unit: tok/s
+            means: worst single boot, client view
+          runs_complete:
+            unit: fraction
+            means: share of the 3 boots whose generation completed with at least 96 of the 128 requested tokens
+          prompt_tokens:
+            unit: count
+            means: prompt tokens per request as reported by the server usage field
+          prompt_tokens_estimated:
+            unit: flag
+            means: 1 when prompt_tokens had to be estimated as chars/4 (must be 0)
+    constraints:
+      - bound: "decode_tps_engine >= 80"
+        on_violation: block
+        holds: stage
+        why: decode TPS above 80 (engine definition) is the declared goal of this run
+      - bound: "prefill_tps_engine >= 950"
+        on_violation: block
+        holds: stage
+        why: prefill must not regress materially below the floor established on the 3.7k workload (1002 median, 999 boot min); 950 leaves 5% measurement headroom
+      - bound: "runs_complete >= 0.66"
+        on_violation: block
+        holds: stage
+        why: a rate built on fewer than two of three completed boots is noise, not a configuration effect
+      - bound: "engine_lines >= 2"
+        on_violation: block
+        holds: stage
+        why: engine-side rates require parsed engine summary lines from at least two boots
+      - bound: "prompt_tokens_estimated <= 0"
+        on_violation: block
+        holds: stage
+        why: the comparison must rest on the server's real token counts, not a chars/4 estimate
+      - bound: "prompt_fresh_tokens >= 18000"
+        on_violation: block
+        holds: stage
+        why: this run's workload IS a ~20k-token fresh prefill; a much smaller fresh count means cache reuse shrank the measured prompt and the gates no longer describe the declared workload
+      - bound: "128 <= completion_tokens_median <= 160"
+        on_violation: block
+        holds: stage
+        why: generations are 128-token requests; materially more per boot means the bench is not measuring the declared 128-token decode workload, materially fewer means the decodes ended too early for a stable rate
+
+models:
+  framework: {provider: codex}
+  worker: {provider: codex}
+
+worker: {kind: pr, max_turns: 40}
+
+budget: {max_usd: 10, max_wall_seconds: 21600, on_limit: pause}
+
+delivery: {mode: local, approval: required}
