@@ -22,7 +22,7 @@
   "--max-context",
   "262144",
   "--kv",
-  "int8",
+  "k8v4",
   "--resident-experts",
   "--kv-resident",
   "32768",
@@ -36,7 +36,9 @@
   "--cvec-dir",
   "per-layer",
   "--mtp-hnorm",
-  "stream"
+  "stream",
+  "--prompt-cache",
+  "0"
  ],
  "cwd": "/home/chihmin/src/Strata",
  "tokenizer": "/home/chihmin/src/Strata-data/packs/iq3_s/tokenizer",
@@ -61,5 +63,6 @@
   "STRATA_GU_RPW": "2",
   "STRATA_DOWN_RPW": "2"
  },
- "open_browser": false
+ "open_browser": false,
+ "reasoning_budget_tokens": 16
 }
