@@ -4,7 +4,9 @@
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /lora-adapters, GET /health, GET /mcp,
+POST /slots/0?action=save|restore|erase, POST /apply-template and POST /completion (llama-server's, for a persistent prompt
+cache).  One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -2115,6 +2117,10 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        # llama-server's slot_snapshot (pi-kv-cache-manager): the session file the live conversation belongs to (the
+        # last request's slot_snapshot, or the last save/restore), whether it changed since that file was written,
+        # the engine process it lives in (a restarted engine holds nothing) and when slot 0 was last used
+        self.slot_owner, self.slot_dirty, self.slot_proc, self.slot_used = "", False, None, 0.0
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2170,9 +2176,64 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
+    def slot_files_on(self) -> bool:
+        """Session files work: a slot save path, an engine that takes SAVE/RESTORE, one request at a time."""
+        return bool(self.slot_save_path) and hasattr(self.engine, "session_file") and not getattr(self.engine, "batch", 0)
+
+    def slot_owner_now(self) -> str:
+        """The session file the engine's live conversation belongs to; "" when none, or when the engine was started
+        again since (a new process holds no conversation)."""
+        if self.slot_owner and getattr(self.engine, "proc", None) is self.slot_proc and self.loaded():
+            return self.slot_owner
+        return ""
+
+    def slot_handover(self, owner: str | None) -> None:
+        """llama-server's slot_snapshot: a request names the session file its conversation belongs to.  Before another
+        owner's request, an unowned one (owner "": a client without a session), a restore or an erase (owner None)
+        replaces the live conversation, the conversation is saved to its owner's file when it changed since that file
+        was last written - a tool-call turn its client did not save, say.  The caller holds the FIFO.  A save the
+        engine refuses is logged; it never fails the request that comes next."""
+        if not self.slot_files_on():
+            return
+        current = self.slot_owner_now()
+        if current and self.slot_dirty and owner != current:
+            try:
+                r = self.engine.session_file("save", os.path.join(self.slot_save_path, current))
+                print(f"[strata] slot 0: saved {r['tokens']} tokens of {current} before another conversation "
+                      f"replaced it ({r['ms']:.0f} ms)", flush=True)
+            except SessionRefused as e:
+                print(f"[strata] slot 0: could not save {current} before another conversation replaced it: {e}",
+                      flush=True)
+        self.slot_dirty = False
+        if owner is not None:                   # a request: what the engine holds next is the owner's, and changes
+            self.slot_owner, self.slot_proc, self.slot_dirty = owner, getattr(self.engine, "proc", None), bool(owner)
+            self.slot_used = time.time()
+
+    def slot_owner_of(self, req: dict) -> str:
+        """The request's slot_snapshot: a plain file name in the slot save path, or "" (unowned).  ValueError for a
+        name a save could not use."""
+        name = req.get("slot_snapshot")
+        if name in (None, ""):
+            return ""
+        why = slot_filename_problem(name)
+        if why:
+            raise ValueError(f"slot_snapshot {why}")
+        return name
+
+    def slots_view(self) -> list[dict]:
+        """GET /slots: llama-server's one slot, with the owner of its conversation and when it was last used (us)."""
+        if not self.loaded():
+            return []
+        with self.status_lock:
+            busy = bool(self.status.get("busy"))
+        return [{"id": 0, "n_ctx": self.engine.max_context, "is_processing": busy,
+                 "snapshot_filename": self.slot_owner_now(), "t_last_used": int(self.slot_used * 1e6)}]
+
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
-        """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
-        to or from a file in slot_save_path.  -> (HTTP status, body)."""
+        """llama-server's POST /slots/{id}?action=save|restore|erase {"filename": ...}: the conversation the engine
+        holds, to or from a file in slot_save_path.  Erase only forgets whose the conversation is (after saving it
+        for its owner when it changed): the engine has no erase, and it never reuses a conversation for a prompt that
+        does not start with exactly its tokens, so what it keeps cannot reach another prompt.  -> (HTTP status, body)."""
         def error(code, message):
             return code, {"error": {"code": code, "message": message,
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
@@ -2184,8 +2245,16 @@ class Service:
             return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
         if slot != "0":
             return error(400, "this server has one slot: 0")
-        if action not in ("save", "restore"):
-            return error(400, "action must be save or restore")
+        if action not in ("save", "restore", "erase"):
+            return error(400, "action must be save, restore or erase")
+        if action == "erase":
+            if not (self.slot_owner_now() and self.slot_dirty):   # nothing to save: no need to wait for the FIFO
+                self.slot_owner, self.slot_dirty = "", False
+                return 200, {"id_slot": 0, "n_erased": 0}
+            with self.fifo:
+                self.slot_handover(None)
+                self.slot_owner, self.slot_used = "", time.time()
+            return 200, {"id_slot": 0, "n_erased": 0}
         why = slot_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
@@ -2211,7 +2280,12 @@ class Service:
                                        else "restoring a session", started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
+                    if action == "restore":
+                        self.slot_handover(None)        # the outgoing conversation, for its owner
                     r = self.engine.session_file(action, path)
+                    # the file and the live conversation are now the same: it is the file's, unchanged
+                    self.slot_owner, self.slot_dirty = filename, False
+                    self.slot_proc, self.slot_used = getattr(self.engine, "proc", None), time.time()
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -2654,17 +2728,29 @@ class Service:
         tail = "" if off else EFFORT_TURN.format(EFFORT_TEXT.get(effort, EFFORT_TEXT["medium"]))
         return history + tail + full[len(mine):]
 
+    def render_prefix(self, messages, tools, kwargs) -> str:
+        """The conversation without the answer's opening, as the request's own prompt starts: with `effort_end` a
+        non-default effort is rendered as a default one (render_prompt puts the effort after this)."""
+        effort = kwargs.get("reasoning_effort")
+        if self.effort_end and (kwargs.get("enable_thinking") is False or effort not in (None, "", "xhigh", "high")):
+            kwargs = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+        return self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
+
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
+        return self.template_prompt(messages, tools, kwargs)[1]
+
+    def template_prompt(self, messages, tools, kwargs, render=None) -> tuple[str, list[int]]:
+        """-> (text, ids) of the prompt `render` (render_prompt) makes, tokenized as encode_prompt says."""
         marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
-        prompt = self.render_prompt(marked, marked_tools, kwargs)
+        prompt = (render or self.render_prompt)(marked, marked_tools, kwargs)
         if not changed:
-            return self.tok.encode(prompt, parse_special=True)
+            return prompt, self.tok.encode(prompt, parse_special=True)
         prompt, plain = unmark_think_literals(prompt, self.literals)
-        return self.tok.encode(prompt, parse_special=True, plain=plain)
+        return prompt, self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def _note_unreadable_tool_images(self, messages):
         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
@@ -2882,6 +2968,9 @@ class Service:
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that)
                     with (self.fifo if par else contextlib.nullcontext()):
                         self.ensure_loaded()
+                    if not par:                         # slot_snapshot: whose conversation the engine holds next
+                        owner = (sampling or {}).get("slot_snapshot") or ""
+                        self.slot_handover("" if not isinstance(owner, str) or slot_filename_problem(owner) else owner)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -3113,6 +3202,8 @@ class Service:
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
+                        if not par:
+                            self.slot_used = time.time()
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
                         if par:
@@ -3820,11 +3911,10 @@ def make_handler(svc: Service):
                     self._props()
             elif path == "/slots":
                 if self._authorized():
-                    loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    with svc.status_lock:
-                        busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                    self._json(200, svc.slots_view())
+            elif path == "/lora-adapters":                   # llama-server's: this engine loads no LoRA adapters
+                if self._authorized():
+                    self._json(200, [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -3835,7 +3925,7 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
-            if path.startswith("/v1/") and self._foreign_page():
+            if (path.startswith("/v1/") or path in ("/apply-template", "/completion")) and self._foreign_page():
                 return
             if path == "/settings":
                 self._settings()
@@ -3924,6 +4014,10 @@ def make_handler(svc: Service):
                     self._json(code, body)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/apply-template":
+                    self._apply_template(req)
+                elif path == "/completion":
+                    self._completion(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -4169,6 +4263,7 @@ def make_handler(svc: Service):
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            svc.slot_owner_of(req)                            # ... and a bad slot_snapshot
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
@@ -4206,6 +4301,55 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _apply_template(self, req):
+            """llama-server's POST /apply-template: a Chat Completions body -> {"prompt": the text the chat path
+            renders}, without the answer's opening when "add_generation_prompt" is false - the prefix a client warms
+            and caches (pi-kv-cache-manager's golden).  Also "tokens": the ids the chat path reads for it (a message's
+            literal <think> stays text there, which the text alone cannot say); POST /completion takes them."""
+            messages, tools, kw = openai_to_messages(req)
+            render = svc.render_prompt if req.get("add_generation_prompt", True) is not False else svc.render_prefix
+            prompt, ids = svc.template_prompt(messages, tools, kw, render)
+            self._json(200, {"prompt": prompt, "tokens": ids})
+
+        def _completion(self, req):
+            """llama-server's POST /completion, as far as a prompt cache needs it: "prompt" (text, read with its
+            control tokens, or token ids), "n_predict" (0: only read the prompt - the engine writes one token, which is
+            not returned), "slot_snapshot"; the sampling keys as on the chat path.  No stream, no grammar, no
+            images.  The conversation it leaves continues like any other (exact token prefixes only)."""
+            prompt = req.get("prompt")
+            if isinstance(prompt, str) and prompt:
+                ids = svc.tok.encode(prompt, parse_special=True)
+            elif isinstance(prompt, list) and prompt and all(isinstance(t, int) and not isinstance(t, bool) and t >= 0
+                                                             for t in prompt):
+                ids = list(prompt)
+            else:
+                raise ValueError("prompt: a non-empty string or list of token ids")
+            if req.get("stream"):
+                raise ValueError("/completion does not stream here; use /v1/chat/completions")
+            n_predict = req.get("n_predict", -1)
+            if isinstance(n_predict, bool) or not isinstance(n_predict, int):
+                raise ValueError("n_predict: a whole number (0: read the prompt only, -1: until the end of the turn)")
+            svc.slot_owner_of(req)                          # a bad slot_snapshot is a 400 before anything runs
+            svc.load()
+            ctx = svc.engine.max_context or getattr(svc.engine, "known_ctx", 0)
+            room = ctx - CTX_SLACK - len(ids)
+            if room < 1:
+                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room in the context ({ctx})")
+            max_new = 1 if n_predict == 0 else min(n_predict, room) if n_predict > 0 else room
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            text, done = [], {}
+            for kind, x in svc.run(ids, False, None, max_new, req, cancel):
+                if kind == "event" and x.kind == "content" and n_predict != 0:
+                    text.append(x.text or "")
+                elif kind == "done":
+                    done = x
+            predicted = 0 if n_predict == 0 else done.get("completion_tokens", 0)
+            self._json(200, {"content": "".join(text), "id_slot": 0, "model": svc.model, "tokens_evaluated": len(ids),
+                             "tokens_predicted": predicted, "stop": True,
+                             "stop_type": "limit" if n_predict == 0 or done.get("finish") == "length" else "eos",
+                             "timings": done.get("timings") or {}})
 
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
@@ -4355,6 +4499,7 @@ def make_handler(svc: Service):
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            svc.slot_owner_of(req)                            # ... and a bad slot_snapshot
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()

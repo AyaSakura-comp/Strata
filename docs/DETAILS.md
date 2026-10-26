@@ -774,8 +774,8 @@ persisted across restarts; the session files below are.
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore
 requests of llama-server's slot API, for its single slot 0, when started with `--slot-save-path DIR` (also
-`"slot_save_path"` in the config); NAME must be a plain file name inside DIR. There is no erase action and the file
-format is Strata's own, not llama.cpp's:
+`"slot_save_path"` in the config); NAME must be a plain file name inside DIR. The file format is Strata's own, not
+llama.cpp's:
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
@@ -783,6 +783,30 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=save"    -H "Content-Type: ap
 curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
 # {"id_slot": 0, "filename": "chat1.bin", "n_restored": 63025, "n_read": 1198691396, "timings": {"restore_ms": 898.2}}
 ```
+
+**Persistent prompt cache (pi-kv-cache-manager).** With a slot save path the server also takes the rest of what
+[pi-kv-cache-manager](https://github.com/AyaSakura-comp/pi-kv-cache-manager) uses on llama-server, so a client can
+keep its sessions and a shared system-prompt snapshot ("golden") on disk:
+
+- A request (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/completion`) may name the session file its
+  conversation belongs to: `"slot_snapshot": NAME`. Before another owner's request, a request without one (an agent's
+  planner call, say), a restore or an erase replaces the live conversation, the server saves it to its owner's file
+  when it changed since that file was last written (a tool-call turn its client did not save). `GET /slots` shows the
+  owner as `snapshot_filename` (empty when none, or after the engine started again) and `t_last_used` (microseconds
+  since the epoch). A save the engine refuses is logged and never fails the request that follows.
+- `POST /slots/0?action=erase` saves a changed conversation for its owner and forgets the owner. The engine keeps
+  what it holds: it reuses a conversation only for a prompt that starts with exactly its tokens, so nothing reaches
+  another prompt.
+- `POST /apply-template` takes a Chat Completions body and returns `{"prompt", "tokens"}`: the text and ids the chat
+  path reads, without the answer's opening when `"add_generation_prompt": false` (with `"effort_position": "end"`,
+  rendered with the default effort, as the chat path's prompt starts).
+- `POST /completion` reads a prompt (text with its control tokens, or the token ids `/apply-template` returned):
+  `"n_predict": 0` only reads it (the engine writes one token, which is not returned), more generates text. No
+  stream, grammar or images.
+- `GET /lora-adapters` answers `[]`.
+
+Run the config with `"effort_position": "end"` for such a client: otherwise the effort sentence opens the system
+turn, and every reasoning effort has its own prefix and golden.
 
 DIR becomes one absolute path at start (`--slot-save-path` relative to the server's working directory, the config's
 `slot_save_path` relative to the config's `"cwd"`), created with mode 0700 when missing. It should be private to the

@@ -91,7 +91,9 @@ class FakeEngine(StrataEngine):
         self.proc = FakeProc(self)
 
 
-class Slots(unittest.TestCase):
+class SlotServer(unittest.TestCase):
+    """The server over a FakeEngine, its slot save path a temporary folder."""
+
     @classmethod
     def setUpClass(cls):
         cls.dir = tempfile.TemporaryDirectory()
@@ -135,6 +137,8 @@ class Slots(unittest.TestCase):
             with e:
                 return e.code, json.loads(e.read())
 
+
+class Slots(SlotServer):
     def test_a_foreign_page_or_a_form_never_reaches_the_engine(self):
         for action in ("save", "restore"):
             for headers, code in (({"Content-Type": "application/json", "Origin": "http://evil.example.com"}, 403),
@@ -443,6 +447,167 @@ class Slots(unittest.TestCase):
         self.svc.fifo.release()
         t.join(10)
         self.assertEqual(out["r"][0], 200)
+
+
+
+class AnsweringEngine(FakeEngine):
+    """FakeEngine that also answers requests ("ok", then the end of the turn) and keeps their prompts."""
+
+    def __init__(self):
+        super().__init__()
+        self.prompts: list[list[int]] = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        tok = ByteTokenizer()
+        yield from (tok.encode("ok") + tok.encode("<|im_end|>", parse_special=True))[:max_new]
+
+
+class SlotOwners(SlotServer):
+    """llama-server's slot_snapshot (pi-kv-cache-manager): whose the live conversation is, saved for its owner before
+    another conversation replaces it; erase; /apply-template, /completion and /lora-adapters for the prompt cache."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.TemporaryDirectory()
+        cls.tok = ByteTokenizer()
+        cls.engine = AnsweringEngine()
+        cls.svc = Service(cls.engine, cls.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.slot_save_path = cls.dir.name
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    def setUp(self):
+        super().setUp()
+        self.svc.slot_owner, self.svc.slot_dirty, self.svc.slot_proc = "", False, None
+        self.svc.effort_end = False
+        self.engine.prompts.clear()
+
+    def chat(self, owner=None, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8, **extra}
+        if owner is not None:
+            body["slot_snapshot"] = owner
+        return self.post("/v1/chat/completions", body)
+
+    def saves(self):
+        return [line for line in self.engine.proc.sent if line.startswith("SAVE ")]
+
+    def slot(self):
+        with urllib.request.urlopen(self.base + "/slots", timeout=10) as r:
+            return json.loads(r.read())[0]
+
+    def save_line(self, name):
+        return f"SAVE {Path(self.dir.name, name)}\n"
+
+    def test_the_owner_is_saved_before_an_unowned_request(self):
+        self.assertEqual(self.chat("a.bin")[0], 200)
+        self.assertEqual(self.saves(), [])                     # nobody owned what was there before
+        self.assertEqual(self.slot()["snapshot_filename"], "a.bin")
+        self.assertGreater(self.slot()["t_last_used"], 0)
+        self.assertEqual(self.chat()[0], 200)                  # a planner call without a session
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])
+        self.assertEqual(self.slot()["snapshot_filename"], "")
+        self.assertEqual(self.chat()[0], 200)                  # unowned after unowned: nothing to keep
+        self.assertEqual(len(self.saves()), 1)
+
+    def test_the_same_owner_continues_without_a_save(self):
+        for _ in range(3):
+            self.assertEqual(self.chat("a.bin")[0], 200)
+        self.assertEqual(self.saves(), [])
+
+    def test_another_owner_saves_the_first_one(self):
+        self.chat("a.bin")
+        self.chat("b.bin")
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])
+        self.assertEqual(self.slot()["snapshot_filename"], "b.bin")
+
+    def test_a_saved_conversation_is_not_saved_again(self):
+        self.chat("a.bin")
+        self.assertEqual(self.post("/slots/0?action=save", {"filename": "a.bin"})[0], 200)
+        self.chat("b.bin")
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])   # only the explicit save
+
+    def test_a_restore_saves_the_outgoing_owner_first(self):
+        Path(self.dir.name, "b.bin").write_bytes(b"x")
+        self.chat("a.bin")
+        s, b = self.post("/slots/0?action=restore", {"filename": "b.bin"})
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.proc.sent, [self.save_line("a.bin"), f"RESTORE {Path(self.dir.name, 'b.bin')}\n"])
+        self.assertEqual(self.slot()["snapshot_filename"], "b.bin")
+        self.chat("b.bin")                                     # continues the restored file: nothing to save
+        self.assertEqual(len(self.saves()), 1)
+
+    def test_a_refused_save_does_not_fail_the_next_request(self):
+        self.chat("a.bin")
+        self.engine.fail = True
+        s, b = self.chat("b.bin")
+        self.assertEqual(s, 200, b)
+        self.assertEqual(len(self.engine.prompts), 2)
+
+    def test_erase_saves_a_changed_owner_and_forgets_it(self):
+        self.chat("a.bin")
+        s, b = self.post("/slots/0?action=erase", {})
+        self.assertEqual((s, b), (200, {"id_slot": 0, "n_erased": 0}))
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])
+        self.assertEqual(self.slot()["snapshot_filename"], "")
+        self.svc.fifo.acquire()                                # nothing to save: no wait for a running request
+        try:
+            self.assertEqual(self.post("/slots/0?action=erase", {})[0], 200)
+        finally:
+            self.svc.fifo.release()
+        self.assertEqual(len(self.saves()), 1)
+
+    def test_a_restarted_engine_holds_no_owner(self):
+        self.chat("a.bin")
+        self.fresh_engine()                                    # a new engine process
+        self.assertEqual(self.slot()["snapshot_filename"], "")
+        self.chat("b.bin")
+        self.assertEqual(self.saves(), [])
+
+    def test_a_bad_slot_snapshot_is_refused(self):
+        for name in ("../a.bin", "a/b", ".hidden", 5):
+            s, b = self.chat(name)
+            self.assertEqual(s, 400, (name, b))
+            self.assertIn("slot_snapshot", b["error"]["message"])
+        self.assertEqual(self.engine.prompts, [])
+
+    def test_apply_template_is_the_start_of_the_chat_prompt(self):
+        system = [{"role": "system", "content": "You are pi. A literal <think> stays text."}]
+        tools = [{"type": "function", "function": {"name": "read", "parameters": {"type": "object"}}}]
+        for effort_end in (False, True):
+            self.svc.effort_end = effort_end
+            for effort in ("xhigh", "low", "medium", "none"):
+                s, t = self.post("/apply-template", {"messages": system, "tools": tools, "reasoning_effort": effort,
+                                                     "add_generation_prompt": False})
+                self.assertEqual(s, 200, t)
+                self.assertTrue(t["prompt"].endswith("<|im_end|>\n"))
+                self.engine.prompts.clear()
+                self.chat(messages=system + [{"role": "user", "content": "hi"}], tools=tools, reasoning_effort=effort)
+                self.assertEqual(self.engine.prompts[0][:len(t["tokens"])], t["tokens"], (effort_end, effort))
+                if effort_end:                                 # one prefix for every effort
+                    s, x = self.post("/apply-template", {"messages": system, "tools": tools,
+                                                         "add_generation_prompt": False})
+                    self.assertEqual(x["tokens"], t["tokens"])
+        s, t = self.post("/apply-template", {"messages": [{"role": "user", "content": "hi"}]})
+        self.assertTrue(t["prompt"].endswith("<|im_start|>assistant\n<think>\n"))   # the chat path's prompt
+
+    def test_completion_can_only_read_the_prompt(self):
+        ids = self.tok.encode("<|im_start|>system\nhello<|im_end|>\n", parse_special=True)
+        s, b = self.post("/completion", {"prompt": ids, "n_predict": 0, "id_slot": 0, "cache_prompt": True})
+        self.assertEqual(s, 200, b)
+        self.assertEqual((b["content"], b["tokens_evaluated"], b["tokens_predicted"]), ("", len(ids), 0))
+        self.assertEqual(self.engine.prompts, [ids])
+        s, b = self.post("/completion", {"prompt": "<|im_start|>system\nhello<|im_end|>\n", "n_predict": 4})
+        self.assertEqual((s, b["content"]), (200, "ok"))
+        self.assertEqual(self.engine.prompts[1], ids)          # the text is read with its control tokens
+        for bad in ({"prompt": ""}, {"prompt": [1, -2]}, {"prompt": "x", "n_predict": "0"}, {"prompt": "x", "stream": True},
+                    {"prompt": "x", "slot_snapshot": "../a"}):
+            self.assertEqual(self.post("/completion", bad)[0], 400, bad)
+        self.assertEqual(len(self.engine.prompts), 2)
+
+    def test_no_lora_adapters(self):
+        with urllib.request.urlopen(self.base + "/lora-adapters", timeout=10) as r:
+            self.assertEqual(json.loads(r.read()), [])
 
 
 if __name__ == "__main__":
