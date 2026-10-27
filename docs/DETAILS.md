@@ -119,6 +119,31 @@ RTX 5090 (IQ3_S, the reporter's measurement).
 smaller subset fits, and the server's start error repeats it; setup suggests `--draft-vocab en` on cards under
 14 GB (only a suggestion: nothing changes unless you pass it).
 
+**FlashHead draft head (opt-in, `STRATA_MTP_FLASHHEAD`):** instead of a token subset, the draft head can read the
+whole vocabulary as retrieval ([FlashHead](https://arxiv.org/abs/2603.14591), as in the llama.cpp fork's draft
+path): `tools/flashhead.py` clusters the main head's rows (balanced spherical k-means, 7,632 clusters of 32 tokens)
+and takes the 4,096 tokens a corpus of the model's own answers uses most as a static set; per draft token the draft
+row is scored against the Q4_0 cluster centroids, the 256 best clusters are picked on the GPU, and the exact
+main-head rows of the static tokens and those clusters' tokens (12,288 rows, 4.9% of 248,320) are the draft logits.
+The verify window keeps the full head, so every answer is unchanged; only the drafts move. Set
+`"STRATA_MTP_FLASHHEAD": "<file>"` (and optionally `"STRATA_MTP_FLASHHEAD_PROBES": "256"`, 1-1024) in the config's
+`env`; the start log says `FlashHead draft head: ...`, and a Q6_K head is required (otherwise the subset stays).
+Measured (IQ3_S, Radeon 8060S gfx1151, a 20K-token prompt reused from the cache, 1024 output tokens with thinking
+off, temperature 0, 3 cold boots per variant interleaved, `bench/flashhead_ab.py`; engine decode tok/s, medians, in
+brackets the drafts accepted of those proposed):
+
+| answer | `--draft-vocab en` | default subset (CJK) | FlashHead | whole head (`STRATA_MTP_FULL_HEAD=1`) |
+|---|---|---|---|---|
+| Chinese | 30.3 (0.32) | 43.4 (0.59) | **45.6** (0.59) | 42.1 (0.61) |
+| English | 50.5 (0.66) | 48.9 (0.66) | 50.0 (0.67) | 46.8 (0.66) |
+| Japanese | 29.3 (0.26) | 39.7 (0.51) | **41.7** (0.49) | 37.8 (0.53) |
+
+Drafts accepted per generated token are the whole head's (Chinese 0.601 vs 0.599, Japanese 0.553 vs 0.551, English
+0.652 vs 0.651), at less time per draft: one draft head evaluation takes 349 us over the English subset (81 MiB),
+926 us over the CJK one (213 MiB), 2325 us over the whole head (497 MiB) and 194 us as FlashHead (35 MiB: centroids
+23 us, the pick 33 us, the rows 125 us; `flashhead_parity --bench`, synthetic data of the same shapes). English
+within run-to-run spread (±3% between boots). Each language's 12 answers were identical across the four heads.
+
 **Serving without the draft layer (`--mtp` is optional):** `serve` runs without `--mtp`. Drafts then come from the
 suffix/prompt-lookup drafter only (or one token per round), every token is still verified against the model, and the
 draft layer's VRAM (~0.7-1 GiB with its head) goes to the expert cache: 1,000 -> 1,678 slots in one A/B on an 8 GB

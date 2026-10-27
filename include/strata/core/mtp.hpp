@@ -242,6 +242,17 @@ private:
     uint8_t* dhead_ = nullptr;
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
+    // FlashHead (STRATA_MTP_FLASHHEAD=<tools/flashhead.py file>; drafts only, the verify window keeps the full head):
+    // the draft head over the whole vocabulary as retrieval - the draft row's scores against Q4_0 cluster centroids
+    // pick fh_p_ clusters (STRATA_MTP_FLASHHEAD_PROBES, default 256), then the exact main-head rows of the static
+    // tokens and of those clusters' tokens are the draft logits.  It replaces the token subset when it loads.
+    bool load_flashhead(const char* path, std::string& err);
+    bool fh_on_ = false;
+    uint8_t* fh_cent_ = nullptr;                          ///< Q4_0 centroids, fh_c_ rows of n_embd
+    int32_t *fh_c2t_ = nullptr, *fh_static_ = nullptr;   ///< cluster c's tokens at c * fh_b_; the static tokens
+    float* fh_scores_ = nullptr;                          ///< the draft row's fh_c_ centroid scores
+    int32_t* fh_ids_ = nullptr;                           ///< its fh_m_ candidates: head_logits_[i] is token fh_ids_[i]
+    int fh_c_ = 0, fh_b_ = 0, fh_s_ = 0, fh_p_ = 0, fh_m_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;

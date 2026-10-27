@@ -129,6 +129,11 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// FlashHead's stage 2 (include/strata/kernels/flashhead.hpp): y[i] = row ids[i] of the [n_vocab, n_in] matrix .
+/// x (one Q8_1 column) for n_rows rows, bitwise the dense ncols = 1 call's y[ids[i]].  Q6_K (the output heads)
+/// only: false, nothing launched, for another type.  A matrix with a STRATA_Q6_PACKED copy is read from the copy.
+bool native_mmvq_rows(int ggml_type, const void* weights, const int32_t* ids, const void* x_q8_1, float* y,
+                      int n_in, int n_rows, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

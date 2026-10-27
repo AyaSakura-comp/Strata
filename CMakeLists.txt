@@ -348,11 +348,22 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/dequant_bf16.cu
                           src/kernels/cuda/qsa_select.cu
                           src/kernels/cuda/verify_kernels.cu
+                          src/kernels/cuda/flashhead.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  # FlashHead's draft head kernels: stage 2 bitwise against the dense head, the cluster pick against a host reference
+  # (GPU, synthetic, no model).  Built on request (--target flashhead_parity) or with the tests.
+  add_executable(flashhead_parity EXCLUDE_FROM_ALL src/kernels/flashhead_parity.cpp)
+  target_include_directories(flashhead_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(flashhead_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS)
+    set_target_properties(flashhead_parity PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME flashhead_parity COMMAND flashhead_parity)
+    set_tests_properties(flashhead_parity PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)

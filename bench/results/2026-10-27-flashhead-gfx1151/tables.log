@@ -1,0 +1,16 @@
+[head] Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf: output.weight Q6_K [2560, 248320]
+[corpus] agent.txt: 521695 tokens
+[corpus] zh.txt: 8648 tokens
+[corpus] ja.txt: 9285 tokens
+[corpus] en.txt: 24098 tokens
+[static] 4096 tokens, 89.7% of the corpus' occurrences
+[head] 244224 rows dequantised in 14 s
+[kmeans] iter   0  mean cos 0.56292
+[kmeans] iter   5  mean cos 0.61352
+[kmeans] iter  10  mean cos 0.61663
+[kmeans] iter  15  mean cos 0.61741
+[kmeans] iter  20  mean cos 0.61771
+[kmeans] iter  25  mean cos 0.61783
+[kmeans] iter  29  mean cos 0.61787
+[kmeans] 7632 clusters of 32 in 30 s
+[done] /tmp/claude-1000/-home-chihmin/68ffa415-1e12-4102-89ec-2a172093ab7f/scratchpad/flashhead-c32-s4096.bin: 7632 clusters x 32 + 4096 static, centroids 10.5 MiB

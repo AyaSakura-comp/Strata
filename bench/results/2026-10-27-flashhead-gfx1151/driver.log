@@ -1,0 +1,56 @@
+[13:22:44] variants ['en', 'cjk', 'fh', 'full'] samples 3 tokens 1024 exe /home/chihmin/src/Strata-fh/build-hip/strata tables /home/chihmin/src/Strata-data/mtp/flashhead-c32-s4096.bin
+[13:23:35] [en-1] loaded after 51 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+86 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 40525 tokens (81.2 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (40525 x 2560, +81.2 MiB)
+[13:24:42] [en-1] zh: 1024 tok 30.30 tok/s, drafts 331/1032 (0.321), reused 20033, finish length, idle True
+[13:25:17] [en-1] en: 1024 tok 50.50 tok/s, drafts 667/1012 (0.659), reused 20033, finish length, idle True
+[13:26:07] [en-1] ja: 1024 tok 29.30 tok/s, drafts 304/1159 (0.262), reused 20033, finish length, idle True
+[13:27:10] [cjk-1] loaded after 51 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 106299 tokens (212.9 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (106299 x 2560, +212.9 MiB)
+[13:28:25] [cjk-1] zh: 1024 tok 43.10 tok/s, drafts 611/1041 (0.587), reused 20033, finish length, idle True
+[13:29:03] [cjk-1] en: 1024 tok 45.00 tok/s, drafts 667/1014 (0.658), reused 20033, finish length, idle True
+[13:29:44] [cjk-1] ja: 1024 tok 38.30 tok/s, drafts 563/1102 (0.511), reused 20033, finish length, idle True
+[13:30:57] [fh-1] loaded after 60 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+99 MiB for the draft head) -> 24576 slots | strata mtp: FlashHead draft head: 7632 clusters of 32 tokens + 4096 static, 256 probes: 12288 of 248320 rows a draft (35.1 MiB read with the centroids, the whole head is 497.3)
+[13:31:53] [fh-1] zh: 1024 tok 45.00 tok/s, drafts 615/1046 (0.588), reused 20033, finish length, idle True
+[13:32:29] [fh-1] en: 1024 tok 48.00 tok/s, drafts 667/1003 (0.665), reused 20033, finish length, idle True
+[13:33:22] [fh-1] ja: 1024 tok 38.70 tok/s, drafts 566/1152 (0.491), reused 20033, finish length, idle True
+[13:34:19] [full-1] loaded after 45 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+5 MiB for the draft head) -> 24576 slots
+[13:35:37] [full-1] zh: 1024 tok 38.00 tok/s, drafts 613/1012 (0.606), reused 20033, finish length, idle True
+[13:36:17] [full-1] en: 1024 tok 41.80 tok/s, drafts 666/1003 (0.664), reused 20033, finish length, idle True
+[13:36:58] [full-1] ja: 1024 tok 39.00 tok/s, drafts 564/1073 (0.526), reused 20033, finish length, idle True
+[13:38:02] [full-2] loaded after 51 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+5 MiB for the draft head) -> 24576 slots
+[13:39:00] [full-2] en: 1024 tok 46.80 tok/s, drafts 667/1004 (0.664), reused 20033, finish length, idle True
+[13:39:43] [full-2] ja: 1024 tok 37.00 tok/s, drafts 564/1073 (0.526), reused 20033, finish length, idle True
+[13:40:23] [full-2] zh: 1024 tok 42.10 tok/s, drafts 614/1010 (0.608), reused 20033, finish length, idle True
+[13:41:20] [fh-2] loaded after 45 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+99 MiB for the draft head) -> 24576 slots | strata mtp: FlashHead draft head: 7632 clusters of 32 tokens + 4096 static, 256 probes: 12288 of 248320 rows a draft (35.1 MiB read with the centroids, the whole head is 497.3)
+[13:42:15] [fh-2] en: 1024 tok 52.00 tok/s, drafts 668/1003 (0.666), reused 20033, finish length, idle True
+[13:42:54] [fh-2] ja: 1024 tok 43.40 tok/s, drafts 566/1152 (0.491), reused 20033, finish length, idle True
+[13:43:39] [fh-2] zh: 1024 tok 47.40 tok/s, drafts 616/1044 (0.590), reused 20033, finish length, idle True
+[13:44:36] [cjk-2] loaded after 45 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 106299 tokens (212.9 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (106299 x 2560, +212.9 MiB)
+[13:45:35] [cjk-2] en: 1024 tok 49.70 tok/s, drafts 666/1014 (0.657), reused 20033, finish length, idle True
+[13:46:16] [cjk-2] ja: 1024 tok 39.70 tok/s, drafts 564/1095 (0.515), reused 20033, finish length, idle True
+[13:46:55] [cjk-2] zh: 1024 tok 43.40 tok/s, drafts 611/1041 (0.587), reused 20033, finish length, idle True
+[13:47:55] [en-2] loaded after 48 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+86 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 40525 tokens (81.2 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (40525 x 2560, +81.2 MiB)
+[13:48:55] [en-2] en: 1024 tok 48.00 tok/s, drafts 666/1016 (0.656), reused 20033, finish length, idle True
+[13:49:46] [en-2] ja: 1024 tok 28.00 tok/s, drafts 304/1159 (0.262), reused 20033, finish length, idle True
+[13:51:35] production strata.service started again
+[13:54:13] variants ['en', 'cjk', 'fh', 'full'] samples 3 tokens 1024 exe /home/chihmin/src/Strata-fh/build-hip/strata tables /home/chihmin/src/Strata-data/mtp/flashhead-c32-s4096.bin
+[13:54:13] resume: 7 complete boots kept
+[13:55:05] [en-2] loaded after 51 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+86 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 40525 tokens (81.2 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (40525 x 2560, +81.2 MiB)
+[13:56:02] [en-2] en: 1024 tok 49.40 tok/s, drafts 667/1011 (0.660), reused 20033, finish length, idle True
+[13:56:52] [en-2] ja: 1024 tok 28.90 tok/s, drafts 304/1158 (0.263), reused 20033, finish length, idle True
+[13:57:40] [en-2] zh: 1024 tok 31.40 tok/s, drafts 330/1031 (0.320), reused 20033, finish length, idle True
+[13:58:37] [en-3] loaded after 45 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+86 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 40525 tokens (81.2 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (40525 x 2560, +81.2 MiB)
+[13:59:48] [en-3] ja: 1024 tok 29.50 tok/s, drafts 304/1155 (0.263), reused 20033, finish length, idle True
+[14:02:23] [en-3] zh: 1024 tok 30.10 tok/s, drafts 330/1036 (0.319), reused 20033, finish length, idle False
+[14:03:09] [en-3] en: 1024 tok 52.70 tok/s, drafts 667/1011 (0.660), reused 20033, finish length, idle True
+[14:04:27] [cjk-3] loaded after 66 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 24576 slots | strata mtp: draft head over 106299 tokens (212.9 MiB) | strata: STRATA_Q6_PACKED=1 packed the MTP draft head (106299 x 2560, +212.9 MiB)
+[14:05:26] [cjk-3] ja: 1024 tok 40.70 tok/s, drafts 564/1095 (0.515), reused 20033, finish length, idle True
+[14:06:04] [cjk-3] zh: 1024 tok 45.50 tok/s, drafts 611/1041 (0.587), reused 20033, finish length, idle True
+[14:06:42] [cjk-3] en: 1024 tok 48.90 tok/s, drafts 667/1010 (0.660), reused 20033, finish length, idle True
+[14:07:39] [fh-3] loaded after 45 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+99 MiB for the draft head) -> 24576 slots | strata mtp: FlashHead draft head: 7632 clusters of 32 tokens + 4096 static, 256 probes: 12288 of 248320 rows a draft (35.1 MiB read with the centroids, the whole head is 497.3)
+[14:08:45] [fh-3] ja: 1024 tok 41.70 tok/s, drafts 566/1152 (0.491), reused 20033, finish length, idle True
+[14:09:23] [fh-3] zh: 1024 tok 45.60 tok/s, drafts 616/1045 (0.589), reused 20033, finish length, idle True
+[14:09:58] [fh-3] en: 1024 tok 50.00 tok/s, drafts 668/999 (0.669), reused 20033, finish length, idle True
+[14:10:58] [full-3] loaded after 48 s: strata generate: expert cache auto: 83.88 GiB free, 700 MiB reserved (+5 MiB for the draft head) -> 24576 slots
+[14:11:59] [full-3] ja: 1024 tok 37.80 tok/s, drafts 564/1073 (0.526), reused 20033, finish length, idle True
+[14:12:37] [full-3] zh: 1024 tok 43.20 tok/s, drafts 614/1010 (0.608), reused 20033, finish length, idle True
+[14:13:17] [full-3] en: 1024 tok 47.60 tok/s, drafts 667/1004 (0.664), reused 20033, finish length, idle True
+[14:13:29] production strata.service started again

@@ -1,0 +1,4 @@
+dense head  40525 rows:   348.5 us  (81.2 MiB, 244 GB/s)
+dense head 106299 rows:   925.5 us  (212.9 MiB, 241 GB/s)
+dense head 248320 rows:  2325.3 us  (497.3 MiB, 224 GB/s)
+FlashHead: centroids 22.6 us + pick 32.6 us + 12288 rows 124.9 us = 193.6 us back to back

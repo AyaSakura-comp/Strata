@@ -1268,6 +1268,32 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
+// FlashHead's stage 2: y[i] = row ids[i] . x for one activation column.  The ncols = 1 exact layout (four warps, a
+// row a block, the same loads, sums and reduction as native_mmvq_multi_kernel<F, 1, WARPS, 1>), so y[i] is bitwise the
+// dense call's y[ids[i]]; only the row each block reads differs.
+template<typename F>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_rows_kernel(const typename F::Block* __restrict__ w, const int32_t* __restrict__ ids,
+                                        const Q81Block* __restrict__ x, float* __restrict__ y, int n_in) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    const std::size_t row = std::size_t(ids[blockIdx.x]);
+    float tmp = 0.0f;
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kqs = F::kqs(tid);
+        const typename F::W wv = F::load(w + row * blocks_per_row + kbx, kqs);
+        tmp += F::apply(wv, x + kbx * F::KBY, kqs);
+    }
+    __shared__ float partial[WARPS - 1][WARP];
+    if (threadIdx.y > 0) partial[threadIdx.y - 1][threadIdx.x] = tmp;
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int l = 0; l < WARPS - 1; ++l) tmp += partial[l][threadIdx.x];
+    tmp = warp_sum(tmp);
+    if (threadIdx.x == 0) y[blockIdx.x] = tmp;
+}
+
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
@@ -1612,6 +1638,52 @@ __global__ void native_q6_k_packed_kernel(const int* __restrict__ ql, const int*
                 tmp[j] = warp_sum(tmp[j]);
                 if (threadIdx.x == 0) y[std::size_t(j) * n_out + row] = tmp[j];
             }
+        }
+    }
+}
+
+// FlashHead's stage 2 on the packed planes: output i is row ids[i] (persistent workgroups, i = blockIdx.x, +row_step,
+// ...), with the packed kernel's loads, per-thread order and reduction for one column - bitwise its y[ids[i]]
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_q6_k_packed_rows_kernel(const int* __restrict__ ql, const int* __restrict__ qh,
+                                               const int8_t* __restrict__ sc, const half* __restrict__ dpl,
+                                               const int32_t* __restrict__ ids, const Q81Block* __restrict__ x,
+                                               float* __restrict__ y, int n_in, int n_rows, int row_step) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int nb = n_in / 256;
+    const int iqs = tid % 32;
+    const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+    const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+    const int vh_shift = 2 * ((iqs % 16) / 8);
+    const int qh_word = 8 * (iqs / 16) + iqs % 8;
+    __shared__ float partial[2][WARPS - 1][WARP];
+    int buf = 0;
+    for (int i = int(blockIdx.x); i < n_rows; i += row_step, buf ^= 1) {
+        const std::size_t row = std::size_t(ids[i]);
+        float tmp = 0.0f;
+        for (int kbx = tid / 32; kbx < nb; kbx += WARPS * WARP / 32) {
+            const std::size_t block = row * nb + kbx;
+            const int vl = STRATA_Q8P_LOAD(ql + block * 32 + iqs);
+            const int vh = STRATA_Q8P_LOAD(qh + block * 16 + qh_word) >> vh_shift;
+            const int8_t* scales = sc + block * 16 + scale_offset;
+            const float d = dpl[block];
+            const Q81Block* xb = x + kbx * 8;
+            int u[2];
+            float d8[2];
+#pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                u[k] = reinterpret_cast<const int*>(xb[bq8_offset + 2 * k].qs)[iqs % 8];
+                d8[k] = __low2float(xb[bq8_offset + 2 * k].ds);
+            }
+            tmp += q6_q8_dot_impl(vl, vh, u, scales, d, d8);
+        }
+        if (threadIdx.y > 0) partial[buf][threadIdx.y - 1][threadIdx.x] = tmp;
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int l = 0; l < WARPS - 1; ++l) tmp += partial[buf][l][threadIdx.x];
+            tmp = warp_sum(tmp);
+            if (threadIdx.x == 0) y[i] = tmp;
         }
     }
 }
@@ -2089,6 +2161,34 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
         native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
     }
     launch_check();
+}
+
+bool native_mmvq_rows(int ggml_type, const void* weights, const int32_t* ids, const void* x_q8_1, float* y,
+                      int n_in, int n_rows, void* stream) {
+    if (ggml_type != 14) return false;   // Q6_K: the output heads
+    validate_shape(n_in, 1, 256);
+    if (n_rows <= 0) throw std::invalid_argument("native MMVQ rows requires n_rows > 0");
+    validate_pointer(weights);
+    validate_pointer(ids);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    // a STRATA_Q6_PACKED=1 head is read from its packed planes, as its dense calls are
+    auto& registry = q6_packed_registry();
+    const auto found = g_q6_bypass ? registry.end() : registry.find(weights);
+    if (found != registry.end() && found->second.n_in == n_in) {
+        const Q6Packed& p = found->second;
+        const int grid = (std::min)(n_rows, q6p_grid());
+        native_q6_k_packed_rows_kernel<<<unsigned(grid), dim3(WARP, WARPS), 0, s>>>(p.ql, p.qh, p.sc, p.d, ids, x, y,
+                                                                                    n_in, n_rows, grid);
+    } else {
+        native_mmvq_rows_kernel<Q6KTraits><<<unsigned(n_rows), dim3(WARP, WARPS), 0, s>>>(
+            static_cast<const Q6KBlock*>(weights), ids, x, y, n_in);
+    }
+    launch_check();
+    return true;
 }
 
 void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,

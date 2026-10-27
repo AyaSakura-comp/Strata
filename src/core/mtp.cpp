@@ -11,6 +11,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/flashhead.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -154,6 +155,8 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) cudaFree(head_logits_);
     if (owns_draft_head_ && dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
+    if (owns_draft_head_ && fh_cent_) cudaFree(fh_cent_);   // fh_c2t_ and fh_static_ live in the same allocation
+    if (fh_scores_) cudaFree(fh_scores_);                   // fh_ids_ too
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
@@ -481,6 +484,16 @@ void MtpDrafter::record_top2(int j) {
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
+    const bool fh = std::getenv("STRATA_MTP_FLASHHEAD") != nullptr && std::getenv("STRATA_MTP_FLASHHEAD")[0] != '\0';
+    if (fh && fh_cent_ == nullptr && !full_head_env()) {
+        // FlashHead instead of the subset (an upper bound: bind() may keep the subset when it cannot use the tables)
+        if (FILE* f = std::fopen(std::getenv("STRATA_MTP_FLASHHEAD"), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long size = std::ftell(f);
+            std::fclose(f);
+            if (size > 0) bytes += (uint64_t) size + (uint64_t) n_vocab * 4;
+        }
+    }
     if (dhead_ == nullptr && owns_draft_head_ && !full_head_env()) {
         if (FILE* f = std::fopen(vocab_file().c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
@@ -589,6 +602,60 @@ void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
 }
 }  // namespace
 
+namespace {
+// STRATA_MTP_FLASHHEAD=<file>: the draft head as retrieval (tools/flashhead.py), "" when unset
+const char* flashhead_env() {
+    const char* v = std::getenv("STRATA_MTP_FLASHHEAD");
+    return v != nullptr ? v : "";
+}
+constexpr size_t kFhHeader = 28;   // "SFH1" and six u32: version, n_in, n_vocab, clusters, cluster size, static count
+}  // namespace
+
+// FlashHead: tools/flashhead.py's tables into one device allocation (Q4_0 centroids, then int32 c2t, then the int32
+// static tokens).  Checked against this model: its embedding width and vocabulary, every id in range.
+bool MtpDrafter::load_flashhead(const char* path, std::string& err) {
+    std::vector<uint8_t> raw;
+    if (!read_file(path, raw) || raw.size() < kFhHeader || std::memcmp(raw.data(), "SFH1", 4) != 0) {
+        err = std::string("mtp: STRATA_MTP_FLASHHEAD: ") + path + " is not a tools/flashhead.py file";
+        return false;
+    }
+    uint32_t h[6];
+    std::memcpy(h, raw.data() + 4, sizeof(h));
+    const uint64_t cent = (uint64_t) h[3] * (h[1] / 32) * 18, c2t = (uint64_t) h[3] * h[4] * 4, stat = (uint64_t) h[5] * 4;
+    if (h[0] != 1 || (int64_t) h[1] != g_->n_embd || (int64_t) h[2] != n_vocab_ || h[1] % 64 != 0 || h[3] == 0 ||
+        h[4] == 0 || raw.size() != kFhHeader + cent + c2t + stat) {
+        err = std::string("mtp: STRATA_MTP_FLASHHEAD: ") + path + "'s tables are not for this model";
+        return false;
+    }
+    int probes = 256;
+    if (const char* v = std::getenv("STRATA_MTP_FLASHHEAD_PROBES"); v != nullptr && v[0] != '\0') probes = std::atoi(v);
+    if (probes < 1 || probes > 1024 || probes > (int) h[3] || (int64_t) h[5] + (int64_t) probes * h[4] > n_vocab_) {
+        err = "mtp: STRATA_MTP_FLASHHEAD_PROBES must be 1 to 1024 and at most the cluster count";
+        return false;
+    }
+    const int32_t* ids = (const int32_t*) (raw.data() + kFhHeader + cent);
+    for (uint64_t i = 0; i < (c2t + stat) / 4; ++i)
+        if (ids[i] < 0 || ids[i] >= n_vocab_) { err = "mtp: STRATA_MTP_FLASHHEAD: a token id out of range"; return false; }
+    if (cudaMalloc((void**) &fh_cent_, raw.size() - kFhHeader) != cudaSuccess) {
+        err = "mtp: the FlashHead tables do not fit";
+        return false;
+    }
+    cudaMemcpy(fh_cent_, raw.data() + kFhHeader, raw.size() - kFhHeader, cudaMemcpyHostToDevice);
+    fh_c2t_ = (int32_t*) (fh_cent_ + cent);   // cent is a multiple of 4: n_embd / 32 is even
+    fh_static_ = fh_c2t_ + c2t / 4;
+    fh_c_ = (int) h[3];
+    fh_b_ = (int) h[4];
+    fh_s_ = (int) h[5];
+    fh_p_ = probes;
+    vram_ += raw.size() - kFhHeader;
+    const double row = (double) head_->row_bytes(), m = (double) fh_s_ + (double) probes * fh_b_;
+    std::fprintf(stderr, "strata mtp: FlashHead draft head: %d clusters of %d tokens + %d static, %d probes: %.0f of "
+                         "%lld rows a draft (%.1f MiB read with the centroids, the whole head is %.1f)\n",
+                 fh_c_, fh_b_, fh_s_, probes, m, (long long) n_vocab_, (m * row + (double) cent) / 1048576.0,
+                 (double) n_vocab_ * row / 1048576.0);
+    return true;
+}
+
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
                       const MtpDrafter* shared) {
     const OnDevice on_device(device_);
@@ -615,8 +682,37 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         n_dvocab_ = shared->n_dvocab_;
         owns_draft_head_ = false;
     }
+    // FlashHead: the whole vocabulary instead of a token subset.  The diagnostics and the coupled sampler read a
+    // subset's or the whole head's logits, so they keep those; stage 2 reads Q6_K rows (the shipped heads).
+    if (flashhead_env()[0] != '\0' && !full_head_env() && !top2_env() && !coupled_draft_env() && !q4_head_) {
+        if (head->type() != 14) {
+            std::fprintf(stderr, "strata mtp: STRATA_MTP_FLASHHEAD needs a Q6_K head (this one is type %d): the draft "
+                                 "head stays as it was\n", head->type());
+        } else if (shared != nullptr) {
+            fh_cent_ = shared->fh_cent_;
+            fh_c2t_ = shared->fh_c2t_;
+            fh_static_ = shared->fh_static_;
+            fh_c_ = shared->fh_c_;
+            fh_b_ = shared->fh_b_;
+            fh_s_ = shared->fh_s_;
+            fh_p_ = shared->fh_p_;
+        } else if (!load_flashhead(flashhead_env(), err)) {
+            return false;
+        }
+        if (fh_cent_ != nullptr) {
+            fh_m_ = fh_s_ + fh_p_ * fh_b_;
+            const size_t scores = ((size_t) fh_c_ * sizeof(float) + 255) & ~(size_t) 255;
+            if (cudaMalloc((void**) &fh_scores_, scores + (size_t) fh_m_ * sizeof(int32_t)) != cudaSuccess) {
+                err = "mtp: the FlashHead scratch does not fit";
+                return false;
+            }
+            fh_ids_ = (int32_t*) ((uint8_t*) fh_scores_ + scores);
+            vram_ += scores + (size_t) fh_m_ * sizeof(int32_t);
+            fh_on_ = true;
+        }
+    }
     // the draft head's token subset, when tools/draft_vocab.py wrote one
-    if (dhead_ == nullptr && shared == nullptr && !full_head_env()) {
+    if (dhead_ == nullptr && shared == nullptr && !full_head_env() && !fh_on_) {
         std::vector<uint8_t> raw;
         if (read_file(vocab_file(), raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
@@ -994,10 +1090,19 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
                         sample_ + t * N, dummy_inj_, cs);
         }
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
-        const bool sub = dhead_ != nullptr;
-        const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
-                    (int) nv, T, cs);
+        // FlashHead: the centroid scores pick the clusters, then the main head's exact rows for the static tokens and
+        // the picked clusters' tokens are the logits (head_logits_[i] is token fh_ids_[i])
+        const bool fh = fh_on_ && T == 1;
+        const bool sub = !fh && dhead_ != nullptr;
+        const int64_t nv = fh ? fh_m_ : sub ? n_dvocab_ : n_vocab_;
+        if (fh) {
+            native_mmvq(GGML_Q4_0, fh_cent_, xq_, fh_scores_, (int) N, fh_c_, 1, cs);
+            flashhead_select(fh_scores_, 1, fh_c_, fh_p_, fh_c2t_, fh_b_, fh_static_, fh_s_, fh_ids_, cs);
+            native_mmvq_rows(head_->type(), head_->weights(), fh_ids_, xq_, head_logits_, (int) N, fh_m_, cs);
+        } else {
+            native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
+                        (int) nv, T, cs);
+        }
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
@@ -1015,7 +1120,8 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
         else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
-        if (sub) map_ids(out_ids_, dvocab_, T, cs);
+        if (fh) map_ids(out_ids_, fh_ids_, T, cs);
+        else if (sub) map_ids(out_ids_, dvocab_, T, cs);
     } catch (const std::exception& e) {
         err = std::string("mtp: ") + e.what();
         return false;
