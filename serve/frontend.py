@@ -91,6 +91,21 @@ def effort_kwargs(value) -> dict:
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
+# #123: the request fields that set a hard thinking budget, the first one given wins: Strata's own, then the names
+# llama-server (thinking_budget_tokens, which pi sends to a llama.cpp model), vLLM (thinking_token_budget) and other
+# OpenAI-compatible servers use
+BUDGET_FIELDS = ("reasoning_budget_tokens", "thinking_budget_tokens", "thinking_token_budget", "thinking_budget")
+
+
+def budget_field(req) -> tuple[str, object]:
+    """-> (the budget field the request gives, its value), or ("reasoning_budget_tokens", None) when it gives none."""
+    if isinstance(req, dict):
+        for name in BUDGET_FIELDS:
+            if req.get(name) is not None:
+                return name, req[name]
+    return BUDGET_FIELDS[0], None
+
+
 def budget_effort(tokens) -> dict:
     """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
     try:
@@ -419,7 +434,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
-    elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
+    elif thinking is None and not budget_field(req)[1] and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
         # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none

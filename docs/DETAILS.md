@@ -569,7 +569,11 @@ print(r.choices[0].message.content)
   answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
   part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
   `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
-  Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+  Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above. The names other servers use
+  work the same way: llama-server's `thinking_budget_tokens` (its `-1`, no budget, is no budget here too), vLLM's
+  `thinking_token_budget` and `thinking_budget`; when a request gives several, `reasoning_budget_tokens` wins. A pi
+  model whose provider sets `"compat": {"thinkingTokenBudgetField": "thinking_budget_tokens"}` sends pi's
+  `thinkingBudgets` for the chosen level this way, next to its `reasoning_effort`.
 - **A reply stuck on one token is ended (0.1.39, #606).** When a reply repeats the same token 256 times in a row, the
   server ends it there with `finish_reason` `"length"` and says so in its window: a model in a loop, or a broken
   state that answers one token forever (#606 saw 36,689 tokens of `!`). `"repeat_stop_tokens": N` in

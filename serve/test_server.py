@@ -85,6 +85,7 @@ class MaxTokens(unittest.TestCase):
         self.assertNotIn("enable_thinking", kw(thinking={"type": "enabled", "budget_tokens": 2048}))
         self.assertNotIn("enable_thinking", kw(output_config={"effort": "high"}))
         self.assertNotIn("enable_thinking", kw(reasoning_budget_tokens=30))
+        self.assertNotIn("enable_thinking", kw(thinking_budget_tokens=30))    # llama-server's name for it
 
     def test_count_tokens_is_the_prompt_messages_reads(self):
         # /v1/messages/count_tokens renders and tokenizes the same prompt /v1/messages would read, without running it
@@ -2710,7 +2711,30 @@ class ThinkingBudget(unittest.TestCase):
                 code, b = self.openai(reasoning_budget_tokens=bad)
                 self.assertEqual(code, 400)
                 self.assertIn("reasoning_budget_tokens", b["error"]["message"])
+        code, b = self.openai(thinking_budget_tokens="lots")     # the 400 names the field the request gave
+        self.assertEqual(code, 400)
+        self.assertIn("thinking_budget_tokens=", b["error"]["message"])
         self.assertEqual(self.engine.prompts, [])
+
+    def test_the_names_other_servers_use(self):
+        """pi sends llama-server's thinking_budget_tokens to a llama.cpp model; vLLM's and the other names cap the
+        thinking the same way.  Strata's own name wins, and llama-server's -1 (no budget) is no budget here too."""
+        from serve.frontend import BUDGET_FIELDS
+        for name in BUDGET_FIELDS[1:]:
+            with self.subTest(field=name):
+                self.engine.prompts = []
+                code, b = self.openai(**{name: 20})
+                self.assertEqual(code, 200, b)
+                self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(
+                    ThinkingEngine.THOUGHT[:20] + "\n"))
+                self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+                self.assertEqual(len(self.engine.prompts), 2)
+        for extra in ({"reasoning_budget_tokens": 0, "thinking_budget_tokens": 20}, {"thinking_budget_tokens": -1}):
+            with self.subTest(extra=extra):
+                self.engine.prompts = []
+                code, b = self.openai(**extra)
+                self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
+                self.assertEqual(len(self.engine.prompts), 1)
 
 
 class CallingEngine(MockEngine):
