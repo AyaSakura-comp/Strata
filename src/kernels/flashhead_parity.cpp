@@ -2,6 +2,7 @@
 //
 //     build/flashhead_parity          the checks below; exit 1 on any difference
 //     build/flashhead_parity --bench  one draft head evaluation's time: the subsets, the whole head, FlashHead
+//     build/flashhead_parity --bench CLUSTERS PROBES   FlashHead alone with that many clusters and probes
 //
 // 1. native_mmvq_rows (stage 2): random Q6_K rows (random codes and scales, fp16 d in a realistic range) and a random
 //    activation.  y[i] for ids with repeats, the first and the last row must be the dense native_mmvq's y[ids[i]],
@@ -151,8 +152,8 @@ void select_parity(cudaStream_t s, int n_rows, int n_clusters, int probes, int b
 // 40,525 (en) and 106,299 (cjk) rows, the whole 248,320-row head, and FlashHead (the Q4_0 centroid scores, the pick,
 // 12,288 rows of the whole head).  Median of 9 batches of 20 launches, in microseconds.  Synthetic data: the timing
 // depends on the bytes read, not on the values.
-void bench(cudaStream_t s) {
-    const int n_in = 2560, n_vocab = 248320, clusters = 7632, b = 32, n_static = 4096, probes = 256;
+void bench(cudaStream_t s, int clusters = 7632, int probes = 256, bool dense = true) {
+    const int n_in = 2560, n_vocab = 248320, b = 32, n_static = 4096;
     std::mt19937 rng(3);
     auto random_q6 = [&](int rows) {
         std::vector<uint8_t> w((size_t) rows * (n_in / 256) * 210);
@@ -191,10 +192,12 @@ void bench(cudaStream_t s) {
         return t[4];
     };
     for (int rows : {40525, 106299, n_vocab}) {
+        if (!dense && rows != n_vocab) continue;
         uint8_t* dw = random_q6(rows);
         const float us = time_us([&] { K::native_mmvq(14, dw, xq, dy, n_in, rows, 1, s); });
-        std::printf("dense head %6d rows: %7.1f us  (%.1f MiB, %.0f GB/s)\n", rows, us, rows * 2100.0 / 1048576.0,
-                    rows * 2100.0 / (us * 1e3));
+        if (dense)
+            std::printf("dense head %6d rows: %7.1f us  (%.1f MiB, %.0f GB/s)\n", rows, us, rows * 2100.0 / 1048576.0,
+                        rows * 2100.0 / (us * 1e3));
         if (rows != n_vocab) {
             K::native_q6_k_unpack(dw);
             cudaFree(dw);
@@ -226,8 +229,8 @@ void bench(cudaStream_t s) {
             K::flashhead_select(dsc, 1, clusters, probes, dc2t, b, dst, n_static, dids, s);
             K::native_mmvq_rows(14, dw, dids, xq, dy, n_in, m, s);
         });
-        std::printf("FlashHead: centroids %.1f us + pick %.1f us + %d rows %.1f us = %.1f us back to back\n", t1, t2, m,
-                    t3, all);
+        std::printf("FlashHead %d clusters, %d probes: centroids %.1f us + pick %.1f us + %d rows %.1f us = %.1f us back "
+                    "to back\n", clusters, probes, t1, t2, m, t3, all);
         cudaFree(dc); cudaFree(dc2t); cudaFree(dst); cudaFree(dsc); cudaFree(dids);
         K::native_q6_k_unpack(dw);
         cudaFree(dw);
@@ -246,7 +249,9 @@ int main(int argc, char** argv) {
     cudaStream_t s = nullptr;
     cudaStreamCreate(&s);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) {
-        bench(s);
+        // --bench CLUSTERS PROBES: FlashHead alone at another table size (a subset's clusters, fewer probes)
+        if (argc > 3) bench(s, std::atoi(argv[2]), std::atoi(argv[3]), false);
+        else bench(s);
         cudaStreamDestroy(s);
         return 0;
     }
