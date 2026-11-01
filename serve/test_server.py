@@ -2568,8 +2568,24 @@ class SharingTheGpu(unittest.TestCase):
         self.assertEqual(order, ["vision", "engine"])             # the encoder first, as at a start
         self.assertTrue(self.svc.vision.alive())
 
+    def test_revive_starts_a_dead_engine_not_an_unloaded_one(self):
+        self.svc.revive_s = 0.1
+        self.svc.start_revive()
+        self.engine.running = False                                 # died: an out-of-memory kill, a crash
+        deadline = time.time() + 10
+        while not self.engine.alive() and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(self.engine.alive())
+        self.assertEqual(self.engine.starts, 1)
+        self.assertEqual(self.svc.unload(), "unloaded")            # on purpose: it stays unloaded
+        time.sleep(0.5)
+        self.assertFalse(self.engine.alive())
+        self.assertEqual(self.engine.starts, 1)
+        self.assertEqual(self.chat()[0], 200)                       # the next request loads it, as before
+
     def test_off_by_default(self):
         self.assertEqual((self.svc.idle_unload_s, self.svc.min_free_vram_mib, self.svc.before_load), (0, 0, None))
+        self.assertEqual(self.svc.revive_s, 0)
         self.assertEqual(self.req("/health")[1]["loaded"], True)
 
 

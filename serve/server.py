@@ -2165,6 +2165,8 @@ class Service:
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
         self.before_load = None
+        self.revive_s = 0                                # start an engine that died within this many seconds (0: at
+        #                                                  the next request)
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
@@ -2503,6 +2505,32 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def start_revive(self):
+        """--revive: an engine or image encoder that died (Linux's or earlyoom's out-of-memory kill, a crash, a stall
+        the server ended) starts again within revive_s seconds instead of at the next request.  One unloaded on purpose
+        (POST /unload, the idle unload) stays unloaded.  A start that fails is tried again later, waiting twice as long
+        each time (30 s up to 10 minutes)."""
+        if not self.revive_s or not hasattr(self.engine, "restart"):
+            return
+        print(f"[strata] an engine that dies starts again within {self.revive_s:g} s", flush=True)
+
+        def loop():
+            wait = self.revive_s
+            while True:
+                time.sleep(wait)
+                if (getattr(self.engine, "unloaded", False) or getattr(self.engine, "starting", False)
+                        or (self.loaded() and not self._vision_down())):
+                    wait = self.revive_s
+                    continue
+                print("[strata] the engine is not running and was not unloaded: starting it again", flush=True)
+                try:
+                    self.load()
+                    wait = self.revive_s
+                except Exception as e:                   # no memory for it yet, or it died while starting
+                    wait = min(max(2 * wait, 30.0), 600.0)
+                    print(f"[strata] starting the engine again failed ({e}); next try in {wait:g} s", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -4880,6 +4908,10 @@ def main() -> int:
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
                          "in the config; default: never)")
+    ap.add_argument("--revive", type=float, default=None, metavar="SECONDS",
+                    help="check this often whether the engine died (out-of-memory kill, crash) and start it again at "
+                         "once, not at the next request; an unloaded model stays unloaded (also \"revive_s\" in the "
+                         "config; default: off)")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
                          "\"min_free_vram_mib\" in the config; default: always load)")
@@ -5002,6 +5034,7 @@ def main() -> int:
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.revive_s = a.revive if a.revive is not None else float(cfg.get("revive_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
@@ -5063,6 +5096,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
+    svc.start_revive()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
