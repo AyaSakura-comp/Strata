@@ -17,6 +17,8 @@
   "4",
   "--spec-min-p",
   "0.3",
+  "--mtp-draft-vocab",
+  "/home/chihmin/src/Strata/data/draft_vocab_en.bin",
   "--mtp",
   "/home/chihmin/src/Strata-data/mtp/rt",
   "--max-context",
