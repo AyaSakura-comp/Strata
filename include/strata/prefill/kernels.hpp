@@ -88,6 +88,9 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// moe_combine with D as BF16 rows (STRATA_DM_BF16: experts_native's dm16)
+void moe_combine16(const uint16_t* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                   int64_t T, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

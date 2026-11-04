@@ -40,6 +40,7 @@ namespace fused = strata::prefill::fused;
 
 constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
 
+bool dm16_test() { static const bool on = std::getenv("S20_DM16") != nullptr; return on; }   // BF16 down rows
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
@@ -246,7 +247,7 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
             bt.e0 = e0;
             bt.e1 = std::min(cuts[c + 1], e0 + fused::kMaxBatch);
             for (int e = bt.e0; e < bt.e1; ++e) bt.blob[e - bt.e0] = blob[(size_t) e];
-            fused::experts_native(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s);
+            fused::experts_native(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s, dm16_test());
         }
     }
 }
@@ -288,11 +289,21 @@ void quant32(const float* in, float* out, int n) {
     }
 }
 
-std::vector<float> download(const Dev& d, size_t n) {
+std::vector<float> download_f32(const Dev& d, size_t n) {
     std::vector<float> h(n);
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
     return h;
 }
+// the fused down rows: FP32, or (S20_DM16) BF16 rows widened
+std::vector<float> download_dm(const Dev& d, size_t n) {
+    if (!dm16_test()) return download_f32(d, n);
+    std::vector<uint16_t> h(n);
+    ck(cudaMemcpy(h.data(), d.p, n * 2, cudaMemcpyDeviceToHost), "download16");
+    std::vector<float> f(n);
+    for (size_t i = 0; i < n; ++i) { const uint32_t u = (uint32_t) h[i] << 16; std::memcpy(&f[i], &u, 4); }
+    return f;
+}
+std::vector<float> download(const Dev& d, size_t n) { return download_f32(d, n); }
 std::vector<int32_t> download_i(const Dev& d, size_t n) {
     std::vector<int32_t> h(n);
     ck(cudaMemcpy(h.data(), d.p, n * 4, cudaMemcpyDeviceToHost), "download");
@@ -338,7 +349,7 @@ void reference_part(const Pair& p, cudaStream_t s) {
     run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
     ck(cudaStreamSynchronize(s), "sync");
     const std::vector<float> y_mmq = mq ? download(mbp->dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
-                             y_f = download(fb.dm, (size_t) rows * N);
+                             y_f = download_dm(fb.dm, (size_t) rows * N);
     delete mbp;
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows), fsrc = download_i(fb.src, (size_t) rows);
     for (int64_t i = 0; i < rows; ++i)
@@ -514,7 +525,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     std::printf("  (fused back to back: median %.3f ms, min %.3f; alternating min %.3f; MMQ min %.3f)\n", tf2[4],
                 tf2[0], tf[0], tm[0]);
     const std::vector<float> y_mmq = mq ? download(mb.dm, (size_t) rows * N) : std::vector<float>((size_t) rows * N, 0.0f),
-                             y_f = download(fb.dm, (size_t) rows * N);
+                             y_f = download_dm(fb.dm, (size_t) rows * N);
     const std::vector<int32_t> slot = download_i(fb.slot, (size_t) rows);
     {   // (Aurora S23) a hash of the fused output's bits, to compare two builds bit for bit
         uint64_t hsh = 1469598103934665603ull;

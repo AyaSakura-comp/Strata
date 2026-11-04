@@ -673,6 +673,10 @@ __device__ __forceinline__ nw_i8 nw_wmma(nw_i4 a, nw_i4 b, nw_i8 c) {
     return c;
 #endif
 }
+__device__ __forceinline__ uint32_t bf16_rne(float f) {   // FP32 -> BF16 bits, round to nearest even (no NaN here)
+    const uint32_t u = __float_as_uint(f);
+    return (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;
+}
 __device__ __forceinline__ nw_i4 nw_u4(uint4 v) { return nw_i4{(int) v.x, (int) v.y, (int) v.z, (int) v.w}; }
 
 // W (X1): ALIAS = the H tile lives on the weight buffers (one extra barrier); LB > 0 = amdgpu_waves_per_eu(LB) (VGPR cap).
@@ -867,6 +871,38 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                     *reinterpret_cast<float*>(o + 72 + 4 * hh) = (float) csum;   // (the formats with a minimum)
                 }
             }
+        } else if (out != nullptr) {
+            // STRATA_DM_BF16: the down rows as BF16 (round to nearest even) into `out` - half the bytes of the FP32
+            // rows that moe_combine reads back.  The 64 x 128 tile goes through LDS (the weight buffers, free after the
+            // last stage) so that each row's 256 bytes leave as whole 128-byte lines: a wave's own 32 columns are only
+            // half a line, and half-line writes made the L2 fetch the other half from DRAM (slower than FP32).
+            constexpr int TLD = 128 + 8;                                  // BF16 per staged row (bank spread)
+            static_assert((size_t) kTileRows * TLD * 2 <= (size_t) 2 * NW_ROWS * WLD, "the BF16 tile must fit");
+            uint16_t(*st)[TLD] = reinterpret_cast<uint16_t(*)[TLD]>(wtbuf);
+            __syncthreads();                                              // every wave is done with the last stage
+            if (on) {
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt) {
+                        const int r = 32 * wn + 16 * nt + l16;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            const float v = acc[mt][nt][i], u = __shfl_xor_sync(0xffffffffu, v, 16);
+                            if (hi == 0)
+                                *reinterpret_cast<uint32_t*>(&st[r][32 * wm + 16 * mt + 2 * i]) =
+                                    bf16_rne(v) | (bf16_rne(u) << 16);
+                        }
+                    }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int j = 0; j < kTileRows * 16 / NW_THREADS; ++j) {      // 16-byte chunks: 16 per row
+                const int q = tid + NW_THREADS * j, r = q >> 4, c = q & 15;
+                if (r < nrows)
+                    *reinterpret_cast<uint4*>(out + ((size_t) (row0 + r) * 2560 + rbase) * 2 + 16 * c) =
+                        *reinterpret_cast<const uint4*>(&st[r][8 * c]);
+            }
         } else {
             if (on) {
 #pragma unroll
@@ -1033,6 +1069,14 @@ bool native_supported(int gu_type, int d_type) {
     return !off && requested() && gu_covered(gu_type) && d_covered(d_type) && dev_info().ok;   // opt-in (=1)
 }
 
+bool native_dm16_supported() {
+#if defined(__HIPCC__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {
     if (rows <= 0) return;
     const int64_t nblk = rows * (cols / 64);
@@ -1041,7 +1085,7 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 }
 
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
-                    const int32_t* src, void* ha, float* dm, void* stream) {
+                    const int32_t* src, void* ha, float* dm, void* stream, bool dm16) {
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
     if (!d.ok || !gu_covered(g.gu_type) || !d_covered(g.d_type)) {
@@ -1079,7 +1123,8 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
-#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, 8><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm); } while (0)
+        uint8_t* d16 = dm16 ? reinterpret_cast<uint8_t*>(dm) : nullptr;   // BF16 rows in the same buffer
+#define STRATA_NW_D(T) do { if (occ_d) native_w11_kernel<T, false, true, 8><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, d16, dm); else native_w11_kernel<T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, d16, dm); } while (0)
         if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
         else if (g.d_type == T_Q5_1) STRATA_NW_D(T_Q5_1);
         else if (g.d_type == T_Q8_0) STRATA_NW_D(T_Q8_0);
@@ -1089,6 +1134,10 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         return;
     }
 #endif
+    if (dm16) {
+        std::fprintf(stderr, "prefill fused experts (native): BF16 down rows need the gfx11 kernels\n");
+        std::exit(1);
+    }
     const int ww = pick_ww(n, n_expert);
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once

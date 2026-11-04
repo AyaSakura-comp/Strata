@@ -1261,6 +1261,31 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
 
+// STRATA_DM_BF16: moe_combine4_kernel over BF16 down rows (4 columns = one 8-byte load per slot), the same k order
+__global__ void moe_combine16_kernel(const uint2* __restrict__ Dm, const int32_t* __restrict__ slot,
+                                     const float* __restrict__ w, const float4* __restrict__ shared,
+                                     const float* __restrict__ sg, float4* __restrict__ bo, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;   // 4-column index
+    if (i >= T * (N / 4)) return;
+    const int64_t t = i / (N / 4), d4 = i % (N / 4);
+    float4 s = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    uint2 v[10];
+    float ww[10];
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        ww[k] = w[t * 10 + k];
+        v[k] = Dm[(int64_t) slot[t * 10 + k] * (N / 4) + d4];
+    }
+#pragma unroll
+    for (int k = 0; k < 10; ++k) {
+        s.x = fmaf(ww[k], __uint_as_float(v[k].x << 16), s.x); s.y = fmaf(ww[k], __uint_as_float(v[k].x & 0xFFFF0000u), s.y);
+        s.z = fmaf(ww[k], __uint_as_float(v[k].y << 16), s.z); s.w = fmaf(ww[k], __uint_as_float(v[k].y & 0xFFFF0000u), s.w);
+    }
+    const float g = sigm(sg[t]);
+    const float4 sh = shared[i];
+    bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -1715,6 +1740,13 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #endif
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
     check("moe_combine");
+}
+void moe_combine16(const uint16_t* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
+                   int64_t T, void* stream) {
+    moe_combine16_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+        reinterpret_cast<const uint2*>(Dm), slot, w, reinterpret_cast<const float4*>(shared), sg,
+        reinterpret_cast<float4*>(bo), T);
+    check("moe_combine16");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

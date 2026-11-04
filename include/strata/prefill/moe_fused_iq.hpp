@@ -34,8 +34,10 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 
 /// experts() for native blobs: b.blob[e - e0] is the native blob of expert e (gate at 0, up at g.up_off, down at
 /// g.down_off; 2-byte aligned).  `xa` from quantize_act_native; H in `ha` (act_bytes(n, 640)); down into `dm` at the
-/// rows of `group`.
+/// rows of `group`.  dm16 (native_dm16_supported() only): the down rows as BF16 instead, [n][2560] at `dm`, for
+/// moe_combine16.
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
-                    const int32_t* src, void* ha, float* dm, void* stream);
+                    const int32_t* src, void* ha, float* dm, void* stream, bool dm16 = false);
+bool native_dm16_supported();
 
 }  // namespace strata::prefill::fused

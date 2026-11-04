@@ -2517,6 +2517,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+                    // STRATA_DM_BF16=1: the native kernels' down rows as BF16 (half of Dm's write + read)
+                    static const bool dm16_env = [] { const char* v = std::getenv("STRATA_DM_BF16"); return v && *v == '1'; }();
+                    const bool dm16 = dm16_env && fused_nat && fused::native_dm16_supported();
                     size_t n_order = 0;                   // the routed experts (the debug report; unknown when fused)
                     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
                     if (fused_l) {
@@ -2564,7 +2567,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const auto& f = lay.fmt[(size_t) l];
                                 const fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
                                 fused::experts_native(b, ng, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H,
-                                                      m.Dm, m.cs);
+                                                      m.Dm, m.cs, dm16);
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
@@ -3118,7 +3121,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.pp->p2p)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
-                    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    if (dm16 && !peer_now) moe_combine16(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    else moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
