@@ -1778,7 +1778,19 @@ bool FileExpertSource::pin_cache_complement(
     // only the last few).  The rest keep the mapped-file fallback.
     int64_t keep_from = n_slots;
     if (lend) {
-        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, budget, lend_from_slot);
+        // STRATA_COMPLEMENT_MAX_GIB=N (opt-in): keep at most N GiB of the lend region's experts in RAM, from the last
+        // slot down (the slots a short prompt lends); the others are read from the files only when a longer prompt
+        // lends their slots.  On a unified-memory APU the RAM copy duplicates experts the GPU cache already holds, so
+        // this hands that memory back (to the OS file cache, which the OS can reclaim) at the cost of file reads in
+        // long prompts.  0 keeps none.  Unset: every lendable slot that fits, as before.
+        uint64_t lend_budget = budget;
+        if (const char* v = std::getenv("STRATA_COMPLEMENT_MAX_GIB"); v != nullptr && v[0] != '\0' && std::atof(v) >= 0.0) {
+            const uint64_t cap = (uint64_t) (std::atof(v) * 1073741824.0);
+            if (lend_budget >= bytes && cap < lend_budget - bytes) lend_budget = bytes + cap;
+            std::fprintf(stderr, "FileExpertSource: STRATA_COMPLEMENT_MAX_GIB=%s caps the prompt path's RAM copy at %.2f GiB\n",
+                         v, (double) cap / 1073741824.0);
+        }
+        keep_from = detail::choose_resident_keep_from(slot_bytes, bytes, lend_budget, lend_from_slot);
         if (keep_from < 0) keep_from = n_slots;
         if (keep_from < n_slots) {
             std::vector<std::pair<int32_t, int32_t>> core;
