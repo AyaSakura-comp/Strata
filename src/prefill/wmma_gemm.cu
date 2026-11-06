@@ -16,6 +16,8 @@
 //       1. gemm_wmma_64x64_4w: 4 waves (128 threads), 64T x 64N x 16K tile, double-buffered LDS for W.
 //       2. gemm_wmma_16x16_1w: 1 wave (32 threads), 16T x 16N x 16K tile, zero LDS/barriers, for small T/N.
 
+#include <cstdio>
+#include <cstdlib>
 #include "wmma_gemm.h"
 
 #include <hip/hip_runtime.h>
@@ -689,6 +691,10 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     hipStream_t s = static_cast<hipStream_t>(stream);
     const int acc = beta == 1.0f ? 1 : 0;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
+    // STRATA_PF_LOG=1: one line per dense prefill GEMM (shape survey for the NPU split)
+    static const bool pf_log = [] { const char* v = std::getenv("STRATA_PF_LOG"); return v && v[0] == '1'; }();
+    if (pf_log) std::fprintf(stderr, "pf_gemm T=%lld N=%lld K=%lld ldx=%lld ldw=%lld ldy=%lld beta=%g\n", (long long) T,
+                             (long long) N, (long long) K, (long long) ldx, (long long) ldw, (long long) ldy, beta);
     // STRATA_PF_BK64=0: the BK 32 kernel for the wide shapes too (the A/B; the same bits)
     static const bool bk64 = [] { const char* v = std::getenv("STRATA_PF_BK64"); return !v || v[0] != '0'; }();
     if (N >= 1024 && bk64 && K % 64 == 0) {

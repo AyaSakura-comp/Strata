@@ -45,3 +45,9 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream = nullptr);
+
+/// STRATA_NPU_SPLIT=1 (build option STRATA_NPU_SPLIT): the dense GEMM split over the GPU (columns [0, N_gpu)) and
+/// the XDNA2 NPU (the rest), for the shapes the manifest (STRATA_NPU_MANIFEST) has designs for.  False = not taken
+/// (nothing was enqueued); the caller runs its GPU path.  Y's NPU columns are bf16-rounded.
+bool strata_npu_split_gemm(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                           int64_t N, int64_t K, int64_t ldy, float beta, void* stream);
