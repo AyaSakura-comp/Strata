@@ -196,6 +196,12 @@ def focused_recovery_prompt(tok, ids, generated):
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+# POST /completion with n_predict 0 and a text prompt (a client warming the prompt it will send next): the tokens at the
+# end of a text cut where the client's text stopped, and the text that follows can merge with them ("\n" + "\n## ..."
+# is one "\n\n" token in the longer text).  The state of a Gated DeltaNet model cannot be cut back, so one token that
+# differs at the end sends the next request back to the last checkpoint (a pi research warm re-read 5,800 tokens).
+# These many are left unread; the next request reads them with its own text.
+WARM_HOLD_TOKENS = 8
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -2121,6 +2127,7 @@ class Service:
         # last request's slot_snapshot, or the last save/restore), whether it changed since that file was written,
         # the engine process it lives in (a restarted engine holds nothing) and when slot 0 was last used
         self.slot_owner, self.slot_dirty, self.slot_proc, self.slot_used = "", False, None, 0.0
+        self.slot_held: list[int] = []                # the prompt of the last request slot 0 ran (slot_continues)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2211,6 +2218,12 @@ class Service:
             self.slot_owner, self.slot_proc, self.slot_dirty = owner, getattr(self.engine, "proc", None), bool(owner)
             self.slot_used = time.time()
 
+    def slot_continues(self, ids) -> bool:
+        """The prompt starts with the whole prompt of the last request slot 0 ran: the same conversation, further on
+        (a client warming its next prompt while a tool runs)."""
+        held = self.slot_held
+        return bool(held) and len(ids) > len(held) and list(ids[:len(held)]) == held
+
     def slot_owner_of(self, req: dict) -> str:
         """The request's slot_snapshot: a plain file name in the slot save path, or "" (unowned).  ValueError for a
         name a save could not use."""
@@ -2284,6 +2297,7 @@ class Service:
                 try:
                     if action == "restore":
                         self.slot_handover(None)        # the outgoing conversation, for its owner
+                        self.slot_held = []             # the engine holds the file's prompt next, not the last request's
                     r = self.engine.session_file(action, path)
                     # the file and the live conversation are now the same: it is the file's, unchanged
                     self.slot_owner, self.slot_dirty = filename, False
@@ -2929,8 +2943,11 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
+            warm=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `warm`: POST /completion with n_predict 0 - without a slot_snapshot it still belongs to the conversation slot 0
+        holds when it continues that conversation (slot_continues), so the owner is neither saved nor replaced.
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -2998,7 +3015,14 @@ class Service:
                         self.ensure_loaded()
                     if not par:                         # slot_snapshot: whose conversation the engine holds next
                         owner = (sampling or {}).get("slot_snapshot") or ""
-                        self.slot_handover("" if not isinstance(owner, str) or slot_filename_problem(owner) else owner)
+                        owner = "" if not isinstance(owner, str) or slot_filename_problem(owner) else owner
+                        # a warm with no owner that continues the conversation the slot holds is that conversation:
+                        # replacing the owner would save it now and tell a client cache (strata-trie-kv) that another
+                        # conversation took the slot, and it would then restore the older file over the warm
+                        if not owner and warm and self.slot_continues(ids):
+                            owner = self.slot_owner_now()
+                        self.slot_handover(owner)
+                        self.slot_held = list(ids)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -4344,7 +4368,9 @@ def make_handler(svc: Service):
             """llama-server's POST /completion, as far as a prompt cache needs it: "prompt" (text, read with its
             control tokens, or token ids), "n_predict" (0: only read the prompt - the engine writes one token, which is
             not returned), "slot_snapshot"; the sampling keys as on the chat path.  No stream, no grammar, no
-            images.  The conversation it leaves continues like any other (exact token prefixes only)."""
+            images.  The conversation it leaves continues like any other (exact token prefixes only).
+            A warm (n_predict 0) of a text prompt leaves its last WARM_HOLD_TOKENS unread, and one without a
+            slot_snapshot that continues the conversation slot 0 holds keeps that conversation's owner (Service.run)."""
             prompt = req.get("prompt")
             if isinstance(prompt, str) and prompt:
                 ids = svc.tok.encode(prompt, parse_special=True)
@@ -4358,6 +4384,8 @@ def make_handler(svc: Service):
             n_predict = req.get("n_predict", -1)
             if isinstance(n_predict, bool) or not isinstance(n_predict, int):
                 raise ValueError("n_predict: a whole number (0: read the prompt only, -1: until the end of the turn)")
+            if n_predict == 0 and isinstance(prompt, str) and len(ids) > WARM_HOLD_TOKENS + 1:
+                ids = ids[:-WARM_HOLD_TOKENS]               # where the text was cut: see WARM_HOLD_TOKENS
             svc.slot_owner_of(req)                          # a bad slot_snapshot is a 400 before anything runs
             svc.load()
             ctx = svc.engine.max_context or getattr(svc.engine, "known_ctx", 0)
@@ -4368,7 +4396,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)
             text, done = [], {}
-            for kind, x in svc.run(ids, False, None, max_new, req, cancel):
+            for kind, x in svc.run(ids, False, None, max_new, req, cancel, warm=n_predict == 0):
                 if kind == "event" and x.kind == "content" and n_predict != 0:
                     text.append(x.text or "")
                 elif kind == "done":

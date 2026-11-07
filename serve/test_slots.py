@@ -19,8 +19,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (ByteTokenizer, Service, StrataEngine, serve, slot_filename_problem,  # noqa: E402
-                          slot_save_dir)
+from serve.server import (WARM_HOLD_TOKENS, ByteTokenizer, Service, StrataEngine, serve,  # noqa: E402
+                          slot_filename_problem, slot_save_dir)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -480,6 +480,7 @@ class SlotOwners(SlotServer):
     def setUp(self):
         super().setUp()
         self.svc.slot_owner, self.svc.slot_dirty, self.svc.slot_proc = "", False, None
+        self.svc.slot_held = []
         self.svc.effort_end = False
         self.engine.prompts.clear()
 
@@ -604,6 +605,61 @@ class SlotOwners(SlotServer):
                     {"prompt": "x", "slot_snapshot": "../a"}):
             self.assertEqual(self.post("/completion", bad)[0], 400, bad)
         self.assertEqual(len(self.engine.prompts), 2)
+
+    def warm(self, prompt, **extra):
+        return self.post("/completion", {"prompt": prompt, "n_predict": 0, "id_slot": 0, "cache_prompt": True, **extra})
+
+    def test_a_text_warm_leaves_its_last_tokens_for_the_next_request(self):
+        # where the client's text stops, the text that follows may merge with the last tokens ("\n" + "\n## ..." is
+        # one "\n\n" token): a warm of a text prompt does not read them, so the next prompt continues its state
+        text = "<|im_start|>user\n<tool_response>\nevidence line one\n"
+        ids = self.tok.encode(text, parse_special=True)
+        s, b = self.warm(text)
+        self.assertEqual(s, 200, b)
+        self.assertEqual(self.engine.prompts, [ids[:-WARM_HOLD_TOKENS]])
+        self.assertEqual(b["tokens_evaluated"], len(ids) - WARM_HOLD_TOKENS)
+        self.assertEqual(self.warm(ids)[0], 200)               # token ids are exact: read whole
+        self.assertEqual(self.engine.prompts[1], ids)
+        self.post("/completion", {"prompt": text, "n_predict": 2})   # not a warm: read whole
+        self.assertEqual(self.engine.prompts[2], ids)
+        self.warm("<|im_start|>u")                             # too short to hold anything back
+        self.assertEqual(self.engine.prompts[3], self.tok.encode("<|im_start|>u", parse_special=True))
+
+    def test_a_warm_that_continues_the_slot_keeps_its_owner(self):
+        # pi warms the prompt of its next request while a tool runs, without a slot_snapshot: it is still the
+        # conversation the slot holds, so nothing is saved and the owner stays (strata-trie-kv would otherwise see
+        # another conversation in the slot and restore the older file over the warm)
+        self.chat("a.bin")
+        held = self.engine.prompts[-1]
+        tool = self.tok.encode("<|im_start|>user\n<tool_response>\n", parse_special=True)
+        for more in (tool + list(b"first evidence"), tool + list(b"first evidence, then more")):
+            s, b = self.warm(held + more)
+            self.assertEqual(s, 200, b)
+            self.assertEqual(self.saves(), [])
+            self.assertEqual(self.slot()["snapshot_filename"], "a.bin")
+        self.chat("a.bin")                                     # the answer request, its own owner again
+        self.assertEqual(self.saves(), [])
+
+    def test_a_warm_of_another_conversation_replaces_the_owner(self):
+        self.chat("a.bin")
+        self.warm(self.tok.encode("<|im_start|>user\nsomething else entirely", parse_special=True))
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])
+        self.assertEqual(self.slot()["snapshot_filename"], "")
+
+    def test_only_a_warm_keeps_the_owner(self):
+        self.chat("a.bin")
+        more = self.engine.prompts[-1] + list(b"more")
+        self.assertEqual(self.post("/completion", {"prompt": more, "n_predict": 2})[0], 200)
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])   # an unowned answer: another client's
+        self.assertEqual(self.slot()["snapshot_filename"], "")
+
+    def test_a_warm_after_a_restore_is_not_taken_for_the_old_conversation(self):
+        Path(self.dir.name, "b.bin").write_bytes(b"x")
+        self.chat("a.bin")
+        held = self.engine.prompts[-1]
+        self.assertEqual(self.post("/slots/0?action=restore", {"filename": "b.bin"})[0], 200)
+        self.warm(held + list(b"more"))                        # the engine holds b.bin's conversation, not a.bin's
+        self.assertEqual(self.slot()["snapshot_filename"], "")
 
     def test_no_lora_adapters(self):
         with urllib.request.urlopen(self.base + "/lora-adapters", timeout=10) as r:
