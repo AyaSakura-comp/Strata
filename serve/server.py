@@ -2127,7 +2127,7 @@ class Service:
         # last request's slot_snapshot, or the last save/restore), whether it changed since that file was written,
         # the engine process it lives in (a restarted engine holds nothing) and when slot 0 was last used
         self.slot_owner, self.slot_dirty, self.slot_proc, self.slot_used = "", False, None, 0.0
-        self.slot_held: list[int] = []                # the prompt of the last request slot 0 ran (slot_continues)
+        self.slot_held: list[int] = []                # what the next prompt of slot 0's conversation repeats (slot_continues)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -2219,10 +2219,31 @@ class Service:
             self.slot_used = time.time()
 
     def slot_continues(self, ids) -> bool:
-        """The prompt starts with the whole prompt of the last request slot 0 ran: the same conversation, further on
-        (a client warming its next prompt while a tool runs)."""
+        """The prompt continues the conversation slot 0 holds (a client warming its next prompt while a tool runs):
+        it starts with everything of the last request that the conversation's next prompt repeats."""
         held = self.slot_held
         return bool(held) and len(ids) > len(held) and list(ids[:len(held)]) == held
+
+    def conversation_prefix(self, ids) -> list[int]:
+        """The part of a chat prompt that the conversation's next prompt starts with: the prompt without the answer's
+        opening (its last turn) and without a reasoning-effort turn right in front of that (#458).  The next prompt
+        renders the answer as the assistant's message instead, and a low or medium effort turn is not repeated: a
+        warm of that next prompt read after a low-effort request would otherwise not count as the same
+        conversation, and strata-trie-kv would restore the older file over it."""
+        ids = list(ids)
+        start = self.tok.encode("<|im_start|>", parse_special=True)
+        role = self.tok.encode("system", parse_special=True)
+
+        def last_turn(end):
+            return next((i for i in range(end - 1, 0, -1) if ids[i] == start[0] and ids[i:i + len(start)] == start), -1)
+
+        cut = last_turn(len(ids))
+        if cut <= 0:
+            return ids
+        effort = last_turn(cut)
+        if self.effort_end and effort > 0 and ids[effort + len(start):effort + len(start) + len(role)] == role:
+            cut = effort
+        return ids[:cut]
 
     def slot_owner_of(self, req: dict) -> str:
         """The request's slot_snapshot: a plain file name in the slot save path, or "" (unowned).  ValueError for a
@@ -3022,7 +3043,8 @@ class Service:
                         if not owner and warm and self.slot_continues(ids):
                             owner = self.slot_owner_now()
                         self.slot_handover(owner)
-                        self.slot_held = list(ids)
+                        # a warm is text the next warm extends; a chat prompt ends with turns its next prompt redoes
+                        self.slot_held = list(ids) if warm else self.conversation_prefix(ids)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",

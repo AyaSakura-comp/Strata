@@ -640,6 +640,27 @@ class SlotOwners(SlotServer):
         self.chat("a.bin")                                     # the answer request, its own owner again
         self.assertEqual(self.saves(), [])
 
+    def test_a_warm_of_the_next_prompt_keeps_the_owner_whatever_the_answer_opening_was(self):
+        # the next prompt renders the answer as the assistant's message, not as the request's answer opening, and
+        # #458 puts a low effort in a system turn in front of that opening, which the next prompt does not repeat:
+        # a warm of the next prompt starts with the conversation before both, and is still that conversation
+        answer = self.tok.encode("<|im_start|>assistant\n<tool_call>\nx\n</tool_call><|im_end|>\n"
+                                 "<|im_start|>user\n<tool_response>\nfirst evidence", parse_special=True)
+        effort_turn = self.tok.encode("<|im_start|>system\nReasoning effort is set to low", parse_special=True)
+        for effort in ("low", "high"):
+            self.setUp()
+            self.svc.effort_end = True
+            self.chat("a.bin", reasoning_effort=effort)
+            prompt = self.engine.prompts[-1]
+            history = self.svc.conversation_prefix(prompt)
+            if effort == "low":                                # the effort turn is left out of the conversation
+                self.assertTrue(any(prompt[i:i + len(effort_turn)] == effort_turn for i in range(len(prompt))))
+                self.assertFalse(any(history[i:i + len(effort_turn)] == effort_turn for i in range(len(history))))
+            s, b = self.warm(history + answer)
+            self.assertEqual(s, 200, b)
+            self.assertEqual(self.saves(), [], effort)
+            self.assertEqual(self.slot()["snapshot_filename"], "a.bin", effort)
+
     def test_a_warm_of_another_conversation_replaces_the_owner(self):
         self.chat("a.bin")
         self.warm(self.tok.encode("<|im_start|>user\nsomething else entirely", parse_special=True))
