@@ -1262,6 +1262,11 @@ class SamplingKeys(unittest.TestCase):
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
             self.assertNotIn("ckpt=0", self.keys(**absent), absent)
 
+    def test_split_key(self):
+        self.assertIn("split=0", self.keys(temperature=0, strata_split=False))
+        for absent in ({}, {"strata_split": True}, {"strata_split": 0}):
+            self.assertNotIn("split=0", self.keys(**absent), absent)
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))

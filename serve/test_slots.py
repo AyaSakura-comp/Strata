@@ -558,6 +558,16 @@ class SlotOwners(SlotServer):
             self.svc.fifo.release()
         self.assertEqual(len(self.saves()), 1)
 
+    def test_flush_saves_a_changed_owner_now_and_keeps_it_live(self):
+        self.chat("a.bin")
+        s, b = self.post("/slots/0?action=flush", {})
+        self.assertEqual((s, b["n_saved"] > 0, b["filename"]), (200, True, "a.bin"))
+        self.assertEqual(self.saves(), [self.save_line("a.bin")])
+        self.assertEqual(self.slot()["snapshot_filename"], "a.bin")   # still the live conversation
+        self.assertEqual(self.post("/slots/0?action=flush", {})[1], {"id_slot": 0, "n_saved": 0})   # unchanged since
+        self.chat("b.bin")                                     # another conversation: nothing left to save first
+        self.assertEqual(len(self.saves()), 1)
+
     def test_a_restarted_engine_holds_no_owner(self):
         self.chat("a.bin")
         self.fresh_engine()                                    # a new engine process

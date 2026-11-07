@@ -871,6 +871,10 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # "strata_split": false - read the prompt in one part (no checkpoint split at its last turn boundary), the
+        # session kept live: a warm, whose text the client's next request extends exactly.  Absent = as before.
+        if sampling.get("strata_split") is False:
+            keys += " split=0"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -2128,6 +2132,7 @@ class Service:
         # the engine process it lives in (a restarted engine holds nothing) and when slot 0 was last used
         self.slot_owner, self.slot_dirty, self.slot_proc, self.slot_used = "", False, None, 0.0
         self.slot_held: list[int] = []                # what the next prompt of slot 0's conversation repeats (slot_continues)
+        self.slot_held_warm = False                   # slot_held is a warm's whole prompt: the engine's state ends there
         self.trie = None                              # --trie-kv: serve/trie_kv.py's prefix-tree cache on the chat path
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -2282,8 +2287,25 @@ class Service:
             return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
         if slot != "0":
             return error(400, "this server has one slot: 0")
-        if action not in ("save", "restore", "erase"):
-            return error(400, "action must be save, restore or erase")
+        if action not in ("save", "restore", "erase", "flush"):
+            return error(400, "action must be save, restore, erase or flush")
+        if action == "flush":
+            # A client about to start another conversation: the live one is written to its owner's file now (when
+            # it changed since), and stays live. The request that replaces it then has nothing to save first, which
+            # took ~0.25 s on its critical path (research prefill, 2026-11-08).
+            if not (self.slot_owner_now() and self.slot_dirty):
+                return 200, {"id_slot": 0, "n_saved": 0}
+            with self.fifo:
+                current = self.slot_owner_now()
+                if not (current and self.slot_dirty and self.loaded()):
+                    return 200, {"id_slot": 0, "n_saved": 0}
+                try:
+                    r = self.engine.session_file("save", os.path.join(self.slot_save_path, current))
+                except SessionRefused as e:
+                    return error(507, f"the engine refused the save: {e}")
+                self.slot_dirty = False
+                print(f"[strata] slot 0: flushed {r['tokens']} tokens of {current} ({r['ms']:.0f} ms)", flush=True)
+                return 200, {"id_slot": 0, "n_saved": r["tokens"], "filename": current}
         if action == "erase":
             if not (self.slot_owner_now() and self.slot_dirty):   # nothing to save: no need to wait for the FIFO
                 self.slot_owner, self.slot_dirty = "", False
@@ -2320,6 +2342,7 @@ class Service:
                     if action == "restore":
                         self.slot_handover(None)        # the outgoing conversation, for its owner
                         self.slot_held = []             # the engine holds the file's prompt next, not the last request's
+                        self.slot_held_warm = False
                     r = self.engine.session_file(action, path)
                     # the file and the live conversation are now the same: it is the file's, unchanged
                     self.slot_owner, self.slot_dirty = filename, False
@@ -3046,6 +3069,7 @@ class Service:
                         self.slot_handover(owner)
                         # a warm is text the next warm extends; a chat prompt ends with turns its next prompt redoes
                         self.slot_held = list(ids) if warm else self.conversation_prefix(ids)
+                        self.slot_held_warm = bool(warm)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
@@ -4411,6 +4435,8 @@ def make_handler(svc: Service):
                 raise ValueError("n_predict: a whole number (0: read the prompt only, -1: until the end of the turn)")
             if n_predict == 0 and isinstance(prompt, str) and len(ids) > WARM_HOLD_TOKENS + 1:
                 ids = ids[:-WARM_HOLD_TOKENS]               # where the text was cut: see WARM_HOLD_TOKENS
+            if n_predict == 0:
+                req["strata_split"] = False                 # one batched part: the next request extends it exactly
             svc.slot_owner_of(req)                          # a bad slot_snapshot is a 400 before anything runs
             svc.load()
             ctx = svc.engine.max_context or getattr(svc.engine, "known_ctx", 0)

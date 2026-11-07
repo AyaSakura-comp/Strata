@@ -364,6 +364,31 @@ class CacheOnTheChatPath(unittest.TestCase):
         self.assertGreaterEqual(d["engine_reused"], base)
         self.assertFalse(self.svc.trie.lock.locked())
 
+    def test_a_warm_before_the_first_chat_request_is_continued_not_restored_over(self):
+        """Research first: a client warms its next prompt (/completion) before any chat request of the turn. The warm
+        leaves another conversation's slot ownerless; the chat request that extends it goes on from it."""
+        self.chat(SYSTEM_A, "hello")                     # golden base + A's leaf
+        self.chat(SYSTEM_B, "what do I hold?")           # another client has the slot
+        question = "new question " + "with evidence words " * 60
+        msgs = [{"role": "system", "content": SYSTEM_A}, {"role": "user", "content": question}]
+        req = urllib.request.Request(self.base + "/apply-template", data=json.dumps(
+            {"messages": msgs, "add_generation_prompt": False}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            prefix = json.loads(r.read())["prompt"]
+        req = urllib.request.Request(self.base + "/completion", data=json.dumps(
+            {"prompt": prefix, "n_predict": 0}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            json.loads(r.read())
+        warmed = len(self.svc.slot_held)
+        self.assertTrue(self.svc.slot_held_warm)
+        self.assertEqual(self.svc.slot_owner_now(), "")  # it left B's conversation
+        self.chat(SYSTEM_A, question)
+        d = self.decisions()[-1]
+        self.assertNotIn("action", d)                    # nothing restored over the warm
+        self.assertEqual(d["live_warm"], warmed)
+        self.assertEqual(d["engine_reused"], warmed)     # the engine went on from the warm's end
+        self.assertFalse(self.svc.slot_held_warm)
+
     def test_streamed_request_is_planned_too(self):
         raw = self.chat(SYSTEM_A, "hello", stream=True)
         self.assertIn(b"[DONE]", raw)

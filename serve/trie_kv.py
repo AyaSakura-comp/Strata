@@ -600,6 +600,17 @@ class TrieCache:
                            self.turn_token)
         slot = self.slot_owner()
         r_live = self.view.resume(ids, slot)
+        # The engine also goes on from the end of a warm (/completion, which this cache does not plan) that this
+        # prompt extends exactly: the evidence a client prefilled before its first chat request of the turn
+        # (research first). Such a warm left the slot without an owner when it left the slot's conversation, so the
+        # view above cannot see it, and the deepest file would be restored over the warm.
+        held = self.svc.slot_held if getattr(self.svc, "slot_held_warm", False) else []
+        engine = np.asarray(engine_ids, np.int32)
+        warm_live = (len(held) if len(ids) == len(engine) and r_live < len(held) < len(engine)
+                     and np.array_equal(engine[:len(held)], np.asarray(held, np.int32)) else 0)
+        if warm_live:
+            r_live = warm_live
+            rec["live_warm"] = warm_live
         r_disk = best[1] if best else 0
         rec.update(trie_ms=round((time.perf_counter() - t1) * 1000, 2), files=len(self.store.files),
                    slot_owner=slot[:40], live=r_live, disk=r_disk, disk_file=best[0] if best else None,
@@ -626,6 +637,8 @@ class TrieCache:
         # another path; each part read on its own and saved, then the request goes on from it
         node = None
         for at, kind in node_cuts(ids, start, r_disk, cut, self.turn_token, self.root_min, self.split_min):
+            if warm_live and at < start:
+                continue                                 # behind the warm the engine holds: no state there to save
             name = f"{self.store.prefix}node_{hashlib.sha1(ids[:at].tobytes()).hexdigest()[:16]}.bin"
             key = "golden" if kind == "golden" else "node"
             t3 = time.perf_counter()
