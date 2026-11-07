@@ -2128,6 +2128,7 @@ class Service:
         # the engine process it lives in (a restarted engine holds nothing) and when slot 0 was last used
         self.slot_owner, self.slot_dirty, self.slot_proc, self.slot_used = "", False, None, 0.0
         self.slot_held: list[int] = []                # what the next prompt of slot 0's conversation repeats (slot_continues)
+        self.trie = None                              # --trie-kv: serve/trie_kv.py's prefix-tree cache on the chat path
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4345,6 +4346,8 @@ def make_handler(svc: Service):
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            if svc.trie is not None and not req.get("slot_snapshot"):   # a client with files of its own keeps them
+                chunks = svc.trie.around(ids, req, chunks)  # --trie-kv: restore / node / own file, before it runs
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -4970,6 +4973,13 @@ def main() -> int:
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--trie-kv", action="store_true",
+                    help="a prefix-tree KV cache on /v1/chat/completions (serve/trie_kv.py): every request is given "
+                         "the deepest saved conversation it continues, each client's system prompt is saved once as "
+                         "its base, no session ids needed; needs --slot-save-path (also \"trie_kv\": true or "
+                         "{\"max_gb\": N} in the config)")
+    ap.add_argument("--trie-kv-max-gb", type=float, default=None, metavar="GB",
+                    help="the slot save folder's quota for --trie-kv (default 40)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
@@ -5098,6 +5108,13 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    if a.trie_kv or cfg.get("trie_kv"):
+        if not svc.slot_files_on():
+            print("[strata] trie-kv is off: it needs slot_save_path (--slot-save-path) and one request at a time",
+                  flush=True)
+        else:
+            from serve import trie_kv
+            svc.trie = trie_kv.from_config(svc, cfg, a.config, a.trie_kv_max_gb)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")

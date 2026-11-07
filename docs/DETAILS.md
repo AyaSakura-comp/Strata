@@ -837,6 +837,28 @@ keep its sessions and a shared system-prompt snapshot ("golden") on disk:
 Run the config with `"effort_position": "end"` for such a client: otherwise the effort sentence opens the system
 turn, and every reasoning effort has its own prefix and golden.
 
+**Prefix-tree prompt cache (`--trie-kv`).** The same without a client-side manager: with `--trie-kv` (or `"trie_kv":
+true`, or `{"max_gb": 40}`, in the config) and a slot save path, every `/v1/chat/completions` request without a
+`slot_snapshot` of its own is planned by `serve/trie_kv.py` before it runs. No session ids: the request's token ids are
+matched against a prefix tree of the session files on disk (only their ids, read from the files' heads), and the
+deepest saved state it continues from is restored when that saves at least 2048 tokens over what the engine holds.
+
+- Each request gets a file of its own (`trie_<ns>_leaf_*.bin`, its conversation's next turn keeps it), saved before
+  another conversation replaces it.
+- The first time a system turn of 2048 tokens or more is read, it is read on its own and saved as a node
+  (`trie_<ns>_node_*.bin`): the golden base of that client, which every later new chat resumes from. A conversation's
+  file cannot stand in, because the engine saves only its deepest checkpoint and a Gated DeltaNet state cannot be cut
+  back. A node is also cut where a request leaves another request's path at a turn boundary no file holds.
+- One quota for the whole folder (default 40 GB, `--trie-kv-max-gb`): another namespace's files first, then the
+  leftovers of pi-kv-cache-manager (`golden_*`, `kv2_*`), then the cache's own, least recently used first, a leaf
+  before its node (a node counts as used whenever a conversation that resumes from it was).
+- `<ns>` is the engine's arguments with each file they name (size and time): a new engine binary or `STRATA_*`
+  variable keeps the cache; a file the engine refuses as another model's is no longer offered. At start the files of
+  strata-trie-kv (the proxy this replaces) for the same config and engine are taken over.
+- One line per request in `DIR/trie-kv.jsonl`: the match (`live`, `disk`, `action`), nodes (`golden`, `node`), what the
+  engine reused (`engine_reused`, `engine_read`). `python3 serve/trie_kv.py --tree` prints the tree,
+  `--dry-run-quota` what the quota would delete. `/v1/messages`, `/v1/responses` and `/completion` are not planned.
+
 DIR becomes one absolute path at start (`--slot-save-path` relative to the server's working directory, the config's
 `slot_save_path` relative to the config's `"cwd"`), created with mode 0700 when missing. It should be private to the
 user that runs Strata: the files hold the conversation's token IDs and state, are created with mode 0600 on Linux
