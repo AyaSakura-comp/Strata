@@ -8033,6 +8033,11 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            // split=0: no part boundary (and so no checkpoint) at the prompt's last turn boundary, the session kept
+            // live as always.  For a warm: text a client prefills that its next request extends exactly, so nothing
+            // resumes at that turn boundary, and the extra part cost a second batched run (~0.45 s on Strix Halo,
+            // research prefill 2026-11-08).  Absent = split as before.
+            int req_split = 1;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -8050,6 +8055,7 @@ int main(int argc, char** argv) {
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "split") req_split = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -8920,7 +8926,7 @@ int main(int argc, char** argv) {
             // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
             // is cheaper to read again than the extra part costs (~0.3 s).
             const int64_t last_turn = turn_at;   // ckpt=0 drops the split there, the root is still looked for before it
-            if (!req_ckpt) turn_at = -1;
+            if (!req_ckpt || !req_split) turn_at = -1;
             int64_t root_at = -1;
             if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
                 for (int64_t i = 1; i < last_turn; ++i)
