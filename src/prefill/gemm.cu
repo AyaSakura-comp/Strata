@@ -385,6 +385,8 @@ Gemm::~Gemm() {
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
+    for (auto& kv : f16_cache_)
+        if (kv.second) cudaFree(kv.second);
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -770,6 +772,45 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 #endif
 }
 
+const uint16_t* Gemm::f16_cached(int ggml_type, const void* W_blocks, int64_t N, int64_t K, int64_t ldw) {
+    static const size_t budget = [] {
+        const char* e = std::getenv("STRATA_PF_F16_CACHE_MIB");
+        return e ? (size_t) std::max(0LL, std::atoll(e)) << 20 : (size_t) 0;
+    }();
+    if (budget == 0 || scratch_elems_ <= 0 || K <= 0) return nullptr;
+    if (ldw <= 0) ldw = K;
+    const auto key = std::make_pair(W_blocks, ldw);
+    if (auto it = f16_cache_.find(key); it != f16_cache_.end()) return it->second;
+    if (f16_cache_full_) return nullptr;
+    const size_t bytes = (size_t) N * (size_t) ldw * 2;
+    uint16_t* img = nullptr;
+    if (f16_cache_bytes_ + bytes > budget || cudaMalloc((void**) &img, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        f16_cache_full_ = true;   // the weights cached so far stay; the rest dequantize per product as before
+        std::fprintf(stderr, "prefill gemm: FP16 weight cache full at %zu MiB (%zu images; budget %zu MiB)\n",
+                     f16_cache_bytes_ >> 20, f16_cache_.size(), budget >> 20);
+        return nullptr;
+    }
+    if (ldw != K) {
+        // the padded image, as the STRATA_PF_PAD path writes it into the scratch (one call); a type it does not
+        // cover is remembered as such (nullptr), so that path keeps falling back without asking again
+        if (!strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, img, stream_)) {
+            cudaFree(img);
+            f16_cache_[key] = nullptr;
+            return nullptr;
+        }
+    } else {
+        // in the row slices native() dequantizes in, so the image is bit for bit what the scratch would hold
+        const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(N, scratch_elems_ / K));
+        for (int64_t r0 = 0; r0 < N; r0 += rows)
+            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, std::min(rows, N - r0), K, img + r0 * K, stream_);
+    }
+    f16_cache_[key] = img;
+    f16_cache_bytes_ += bytes;
+    if (f16_cache_.size() == 1) std::fprintf(stderr, "prefill gemm: FP16 weight cache on (budget %zu MiB)\n", budget >> 20);
+    return img;
+}
+
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
@@ -781,6 +822,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
     if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
         const int64_t ldw = K + 64;
+        if (const uint16_t* w16 = f16_cached(ggml_type, W_blocks, N, K, ldw);
+            w16 && strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, w16, ldw, Y, T, N, K, ldy, beta, stream_)) {
+            return;
+        }
         if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
             strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {
             return;
@@ -808,6 +853,20 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
+    if (const uint16_t* w16 = f16_cached(ggml_type, W_blocks, N, K)) {
+        // the same products as below on the kept image: the same row slices, so every GEMM call keeps its shape
+        if (N * K > scratch_elems_) {
+            const int64_t rows = scratch_elems_ / K;
+            if (ldy <= 0) ldy = N;
+            for (int64_t r0 = 0; r0 < N; r0 += rows) {
+                const int64_t n = (N - r0 < rows) ? N - r0 : rows;
+                f16(X, w16 + r0 * K, Y + r0, T, n, K, ldy, beta);
+            }
+        } else {
+            f16(X, w16, Y, T, N, K, ldy, beta);
+        }
+        return;
+    }
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;

@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <map>
+#include <utility>
 
 namespace strata::prefill {
 
@@ -55,6 +57,10 @@ public:
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
+    /// STRATA_PF_F16_CACHE_MIB: dequantize a native weight's FP16 image now (Prefill::init, for every dense projection)
+    /// instead of in the first prompt read that uses it.
+    void prewarm_native(int ggml_type, const void* W_blocks, int64_t N, int64_t K) { (void) f16_cached(ggml_type, W_blocks, N, K); }
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
@@ -75,6 +81,14 @@ private:
     int64_t tc_x_elems_ = 0;
     bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                     int64_t ldy);
+    /// STRATA_PF_F16_CACHE_MIB=N: a native weight's FP16 image, dequantized once (the first product that uses it) and
+    /// kept, up to N MiB in all; nullptr when off, over the budget or out of memory (native() then dequantizes into
+    /// the scratch, as without it).  The image is what dequant_f16 writes into the scratch, so the products are the same.
+    /// `ldw` > K: the row-padded image STRATA_PF_PAD's path reads (dequant_f16_ld), kept apart from the plain one.
+    const uint16_t* f16_cached(int ggml_type, const void* W_blocks, int64_t N, int64_t K, int64_t ldw = 0);
+    std::map<std::pair<const void*, int64_t>, uint16_t*> f16_cache_;
+    size_t f16_cache_bytes_ = 0;
+    bool f16_cache_full_ = false;
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;

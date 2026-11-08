@@ -933,6 +933,25 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               std::to_string(o.failed_bytes >> 20) + " MiB)";
         return false;
     }
+    // STRATA_PF_F16_CACHE_MIB: the dense projections' FP16 images now, at load. Taken lazily in the first prompt read,
+    // the few GB pushed the expert files out of the page cache mid-request and that answer's slot refill read them
+    // from disk (88 tokens at 3.6 tok/s).  The plain images (row stride K): what native() reads below the switch chunk.
+    if (std::getenv("STRATA_PF_F16_CACHE_MIB")) {
+        static const char* const kGdn[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+        static const char* const kQsa[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"};
+        static const char* const kShared[] = {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+        auto warm = [&](const core::LayerView& v, const char* sfx) {
+            const core::WeightRef* w = v.get(sfx);
+            if (w && w->native_data) m.gemm.prewarm_native(w->native_type, w->native_data, w->ne1, w->ne0);
+        };
+        for (int64_t l = stage_lb_; l < stage_le_; ++l) {
+            const core::LayerView v(*m.wt, l);
+            if (core::is_qsa_layer(g, l)) for (const char* s : kQsa) warm(v, s);
+            else for (const char* s : kGdn) warm(v, s);
+            for (const char* s : kShared) warm(v, s);
+        }
+        cudaStreamSynchronize(m.cs);
+    }
     return true;
 }
 
