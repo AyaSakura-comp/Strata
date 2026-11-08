@@ -60,6 +60,9 @@ public:
     /// STRATA_PF_F16_CACHE_MIB: dequantize a native weight's FP16 image now (Prefill::init, for every dense projection)
     /// instead of in the first prompt read that uses it.
     void prewarm_native(int ggml_type, const void* W_blocks, int64_t N, int64_t K) { (void) f16_cached(ggml_type, W_blocks, N, K); }
+    /// After the prewarm: no image is added any more (no allocation inside a request; the long-prompt path's padded
+    /// products keep dequantizing into the scratch, exactly as without the cache).
+    void freeze_f16_cache() { if (!f16_cache_.empty()) f16_cache_full_ = true; }
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }

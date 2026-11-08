@@ -951,6 +951,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             for (const char* s : kShared) warm(v, s);
         }
         cudaStreamSynchronize(m.cs);
+        m.gemm.freeze_f16_cache();
     }
     return true;
 }
