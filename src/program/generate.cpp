@@ -7236,7 +7236,8 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        // "stop": this engine honours STOP; "gen0": it takes GEN 0 (read the prompt only, no window)
+        std::printf("READY %lld stop gen0\n", (long long) o.max_context);
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -8086,7 +8087,10 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+            // GEN 0: read the prompt only (a client's warm).  The batched read stops before the last token as always,
+            // and no window runs - the one that reads that token and writes a token nobody wants cost ~37 ms - so the
+            // session holds the prompt but its last token, which the next request reads with its own text.
+            if (max_new < (geni ? 1 : 0) || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
