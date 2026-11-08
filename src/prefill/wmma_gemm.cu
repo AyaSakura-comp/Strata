@@ -25,11 +25,8 @@
 #include <cstdlib>
 #include "strata/kernels/gfx_arch.hpp"
 
-#include <algorithm>
 #include <atomic>
 #include <cstring>
-#include <map>
-#include <mutex>
 
 // STRATA_WMMA_GFX11 is defined by the BUILD (CMakeLists.txt, from CMAKE_HIP_ARCHITECTURES), not inferred
 // from compiler macros: measured on this toolchain the HOST pass of a HIP compile does not define
@@ -323,7 +320,7 @@ __device__ __forceinline__ h16 frag(const _Float16* p) {
 template <int BN, int WN>
 __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
                                               float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
-                                              int ldx, int ldw, int kchunk, float* __restrict__ part) {
+                                              int ldx, int ldw) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int TN = WN / 16, NB = BN / 64;
     __shared__ __align__(16) _Float16 sA[2][BM][LDK];
@@ -340,19 +337,17 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
     auto ldB = [&](int k0, int r) -> uint4 {
         return *reinterpret_cast<const uint4*>(W + (size_t) min(n0 + r, N - 1) * ldw + k0 + 8 * sq);
     };
-    // split-K (blockIdx.y): this block's k range; its partial sums go to part[split][M][N] (summed by split_reduce)
-    const int kb = blockIdx.y * kchunk, ke = min(K, kb + kchunk);
     f8 acc[4][TN];
     for (int i = 0; i < 4; ++i) for (int j = 0; j < TN; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
-    uint4 ra0 = ldA(kb, sr), ra1 = ldA(kb, sr + 64), rb0 = ldB(kb, sr), rb1 = ldB(kb, sr + 64), rb2 = rb0, rb3 = rb0;
-    if constexpr (NB > 2) { rb2 = ldB(kb, sr + 128); rb3 = ldB(kb, sr + 192); }
+    uint4 ra0 = ldA(0, sr), ra1 = ldA(0, sr + 64), rb0 = ldB(0, sr), rb1 = ldB(0, sr + 64), rb2 = rb0, rb3 = rb0;
+    if constexpr (NB > 2) { rb2 = ldB(0, sr + 128); rb3 = ldB(0, sr + 192); }
     int buf = 0;
     *reinterpret_cast<uint4*>(&sA[0][sr][8 * sq]) = ra0; *reinterpret_cast<uint4*>(&sA[0][sr + 64][8 * sq]) = ra1;
     *reinterpret_cast<uint4*>(&sB[0][sr][8 * sq]) = rb0; *reinterpret_cast<uint4*>(&sB[0][sr + 64][8 * sq]) = rb1;
     if constexpr (NB > 2) { *reinterpret_cast<uint4*>(&sB[0][sr + 128][8 * sq]) = rb2; *reinterpret_cast<uint4*>(&sB[0][sr + 192][8 * sq]) = rb3; }
     __syncthreads();
-    for (int k0 = kb; k0 < ke; k0 += BK) {
-        const bool more = k0 + BK < ke;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool more = k0 + BK < K;
         if (more) {
             ra0 = ldA(k0 + BK, sr); ra1 = ldA(k0 + BK, sr + 64); rb0 = ldB(k0 + BK, sr); rb1 = ldB(k0 + BK, sr + 64);
             if constexpr (NB > 2) { rb2 = ldB(k0 + BK, sr + 128); rb3 = ldB(k0 + BK, sr + 192); }
@@ -388,12 +383,8 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
             for (int e = 0; e < 8; ++e) {
                 const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
                 if (m < M) {
-                    if (part) {
-                        part[((size_t) blockIdx.y * M + m) * N + n] = acc[i][j][e];
-                    } else {
-                        float* y = Y + (size_t) m * ldy + n;
-                        *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
-                    }
+                    float* y = Y + (size_t) m * ldy + n;
+                    *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
                 }
             }
         }
@@ -406,7 +397,7 @@ __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, co
 // K a multiple of 64.
 __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
                                                    float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
-                                                   int ldx, int ldw, int kchunk, float* __restrict__ part) {
+                                                   int ldx, int ldw) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 256, WN = 64, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) _Float16 sA[BM][LDK64];
@@ -437,18 +428,17 @@ __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ 
         *reinterpret_cast<uint4*>(&sB[sr + 128][8 * sq]) = rb4; *reinterpret_cast<uint4*>(&sB[sr + 160][8 * sq]) = rb5;
         *reinterpret_cast<uint4*>(&sB[sr + 192][8 * sq]) = rb6; *reinterpret_cast<uint4*>(&sB[sr + 224][8 * sq]) = rb7;
     };
-    const int kb = blockIdx.y * kchunk, ke = min(K, kb + kchunk);   // split-K, as in `kernel`
     f8 acc[4][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int j = 0; j < 4; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
-    load(kb);
+    load(0);
     store();
     __syncthreads();
     const int ar = 64 * wm + l16, br = WN * wn + l16;
-    for (int k0 = kb; k0 < ke; k0 += BK64) {
-        const bool more = k0 + BK64 < ke;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
         if (more) load(k0 + BK64);
 #pragma unroll
         for (int ks = 0; ks < BK64; ks += 16) {
@@ -480,12 +470,8 @@ __global__ void __launch_bounds__(256) kernel_bk64(const _Float16* __restrict__ 
             for (int e = 0; e < 8; ++e) {
                 const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
                 if (m < M) {
-                    if (part) {
-                        part[((size_t) blockIdx.y * M + m) * N + n] = acc[i][j][e];
-                    } else {
-                        float* y = Y + (size_t) m * ldy + n;
-                        *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
-                    }
+                    float* y = Y + (size_t) m * ldy + n;
+                    *y = accumulate ? *y + acc[i][j][e] : acc[i][j][e];
                 }
             }
         }
@@ -506,7 +492,7 @@ __device__ __forceinline__ hb16 bfrag(const uint16_t* p) {
 __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict__ X, int ldx,
                                                      const uint16_t* __restrict__ Wd, const uint16_t* __restrict__ Wi,
                                                      int nd, int ni, float* __restrict__ lo, float* __restrict__ inj,
-                                                     int M, int K, int kchunk, float* __restrict__ part) {
+                                                     int M, int K) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 128, WN = 32, TN = 2, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) uint16_t sA[BM][LDK64];
@@ -537,18 +523,17 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
         *reinterpret_cast<uint4*>(&sB[sr][8 * sq]) = rb0; *reinterpret_cast<uint4*>(&sB[sr + 32][8 * sq]) = rb1;
         *reinterpret_cast<uint4*>(&sB[sr + 64][8 * sq]) = rb2; *reinterpret_cast<uint4*>(&sB[sr + 96][8 * sq]) = rb3;
     };
-    const int kb = blockIdx.y * kchunk, ke = min(K, kb + kchunk);   // split-K: partials in part[split][M][N]
     f8 acc[4][TN];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = f8{0, 0, 0, 0, 0, 0, 0, 0};
-    load(kb);
+    load(0);
     store();
     __syncthreads();
     const int ar = 64 * wm + l16, br = WN * wn + l16;
-    for (int k0 = kb; k0 < ke; k0 += BK64) {
-        const bool more = k0 + BK64 < ke;
+    for (int k0 = 0; k0 < K; k0 += BK64) {
+        const bool more = k0 + BK64 < K;
         if (more) load(k0 + BK64);
 #pragma unroll
         for (int ks = 0; ks < BK64; ks += 16) {
@@ -580,8 +565,7 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
             for (int e = 0; e < 8; ++e) {
                 const int m = m0 + 64 * wm + 16 * i + 2 * e + hi;
                 if (m < M) {
-                    if (part) part[((size_t) blockIdx.y * M + m) * N + n] = acc[i][j][e];
-                    else if (n < nd) lo[(size_t) m * nd + n] = acc[i][j][e];
+                    if (n < nd) lo[(size_t) m * nd + n] = acc[i][j][e];
                     else inj[(size_t) m * ni + (n - nd)] = acc[i][j][e];
                 }
             }
@@ -664,68 +648,7 @@ __global__ void __launch_bounds__(HX_NT) kernel_hcd_exact(const uint16_t* __rest
         }
 #endif
 }
-// split-K: the partials summed in split order (deterministic), into Y (row stride ldy, += when accumulate) or, for the
-// hyper-connection read, split at column nd into lo (T x nd) and inj (T x (N - nd)).  Four columns per thread.
-__global__ void __launch_bounds__(256) split_reduce(const float* __restrict__ part, int S, int M, int N,
-                                                    float* __restrict__ Y, int ldy, int accumulate,
-                                                    float* __restrict__ lo, float* __restrict__ inj, int nd) {
-    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
-    const int64_t MN = (int64_t) M * N;
-    if (i >= MN) return;
-    float v = part[i];
-    for (int s = 1; s < S; ++s) v += part[(size_t) s * MN + i];
-    const int m = (int) (i / N), n = (int) (i % N);
-    if (Y) {
-        float* y = Y + (size_t) m * ldy + n;
-        *y = accumulate ? *y + v : v;
-    } else if (n < nd) {
-        lo[(size_t) m * nd + n] = v;
-    } else {
-        inj[(size_t) m * (N - nd) + (n - nd)] = v;
-    }
-}
 }  // namespace pfg
-
-namespace {
-// The split-K workspace of a stream (each stream's GEMMs run in order, so one buffer per stream is enough).
-float* split_ws(hipStream_t s, size_t bytes) {
-    static std::mutex mu;
-    static std::map<hipStream_t, std::pair<void*, size_t>> ws;
-    std::lock_guard<std::mutex> lk(mu);
-    auto& w = ws[s];
-    if (w.second < bytes) {
-        if (w.first) {
-            hipStreamSynchronize(s);
-            hipFree(w.first);
-        }
-        const size_t nb = std::max(bytes, (size_t) 64 << 20);
-        w.first = nullptr;
-        w.second = 0;
-        if (hipMalloc(&w.first, nb) != hipSuccess) {
-            hipGetLastError();
-            w.first = nullptr;
-            return nullptr;
-        }
-        w.second = nb;
-    }
-    return static_cast<float*>(w.first);
-}
-// How many k splits for a launch of `tiles` output blocks over `ktiles` k tiles: enough blocks to fill the GPU
-// (STRATA_PF_SPLIT_TARGET=80 = two per CU on gfx1151; unset or 0 = never split, the products of before bit for bit),
-// at least 4 k tiles per split.  Rounding-level (another summation order): opt-in.
-// Returns the k chunk (elements, a multiple of bk) and sets `splits`.
-int split_chunk(int64_t tiles, int64_t K, int bk, int& splits) {
-    static const int target = [] { const char* e = std::getenv("STRATA_PF_SPLIT_TARGET"); return e ? std::atoi(e) : 0; }();
-    const int64_t ktiles = K / bk;
-    splits = 1;
-    if (target <= 0 || tiles >= target || ktiles < 8) return (int) K;
-    int64_t s = std::min<int64_t>((target + tiles - 1) / tiles, ktiles / 4);
-    if (s <= 1) return (int) K;
-    const int64_t per = (ktiles + s - 1) / s;
-    splits = (int) ((ktiles + per - 1) / per);
-    return (int) (per * bk);
-}
-}  // namespace
 
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
@@ -734,18 +657,8 @@ bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, c
     if (!strata_wmma_gfx11_device()) return false;
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     const unsigned grid = (unsigned) (mt * ((nd + ni + 127) / 128));
-    hipStream_t s = static_cast<hipStream_t>(stream);
-    int splits = 1;
-    const int kchunk = split_chunk(grid, K, 64, splits);
-    float* part = splits > 1 ? split_ws(s, (size_t) splits * T * (nd + ni) * sizeof(float)) : nullptr;
-    if (!part) splits = 1;
-    pfg::kernel_hcdown<<<dim3(grid, splits), 256, 0, s>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni, lo, inj, (int) T,
-                                                         (int) K, splits > 1 ? kchunk : (int) K, part);
-    if (splits > 1) {
-        const int64_t mn = T * (nd + ni);
-        pfg::split_reduce<<<(unsigned) ((mn + 255) / 256), 256, 0, s>>>(part, splits, (int) T, (int) (nd + ni), nullptr,
-                                                                         0, 0, lo, inj, (int) nd);
-    }
+    pfg::kernel_hcdown<<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(X, (int) ldx, Wd, Wi, (int) nd, (int) ni,
+                                                                            lo, inj, (int) T, (int) K);
     return hipGetLastError() == hipSuccess;
 }
 
@@ -778,28 +691,18 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     const int64_t mt = (T + pfg::BM - 1) / pfg::BM;
     // STRATA_PF_BK64=0: the BK 32 kernel for the wide shapes too (the A/B; the same bits)
     static const bool bk64 = [] { const char* v = std::getenv("STRATA_PF_BK64"); return !v || v[0] != '0'; }();
-    const bool wide = N >= 1024, use64 = wide && bk64 && K % 64 == 0;
-    const unsigned grid = (unsigned) (mt * (wide ? (N + 255) / 256 : (N + 127) / 128));
-    int splits = 1;
-    const int kchunk = split_chunk(grid, K, use64 ? 64 : pfg::BK, splits);
-    float* part = splits > 1 ? split_ws(s, (size_t) splits * T * N * sizeof(float)) : nullptr;
-    if (!part) splits = 1;
-    const int kc = splits > 1 ? kchunk : (int) K;
-    const dim3 g(grid, splits);
-    if (use64) {
-        pfg::kernel_bk64<<<g, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
-                                           (int) ldy, acc, (int) ldx, (int) ldw, kc, part);
-    } else if (wide) {
-        pfg::kernel<256, 64><<<g, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
-                                               (int) ldy, acc, (int) ldx, (int) ldw, kc, part);
+    if (N >= 1024 && bk64 && K % 64 == 0) {
+        const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
+        pfg::kernel_bk64<<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
+                                              (int) ldy, acc, (int) ldx, (int) ldw);
+    } else if (N >= 1024) {
+        const unsigned grid = (unsigned) (mt * ((N + 255) / 256));
+        pfg::kernel<256, 64><<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
+                                                  (int) ldy, acc, (int) ldx, (int) ldw);
     } else {
-        pfg::kernel<128, 32><<<g, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
-                                               (int) ldy, acc, (int) ldx, (int) ldw, kc, part);
-    }
-    if (splits > 1) {
-        const int64_t mn = T * N;
-        pfg::split_reduce<<<(unsigned) ((mn + 255) / 256), 256, 0, s>>>(part, splits, (int) T, (int) N, Y, (int) ldy,
-                                                                         acc, nullptr, nullptr, 0);
+        const unsigned grid = (unsigned) (mt * ((N + 127) / 128));
+        pfg::kernel<128, 32><<<grid, 256, 0, s>>>((const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) N, (int) K,
+                                                  (int) ldy, acc, (int) ldx, (int) ldw);
     }
     return hipGetLastError() == hipSuccess;
 }
