@@ -77,6 +77,10 @@ private:
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
     bool f16_io_ = false;
+    int skinny_left_ = -1;   // STRATA_SKINNY_CHECK's products still to compare (-1: not read yet)
+    int skinny_check_left();
+    bool skinny_compare(bool bf, const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                        int64_t K, int64_t ldy);
     // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
     uint16_t* tc_w_ = nullptr;
     int64_t tc_w_elems_ = 0;

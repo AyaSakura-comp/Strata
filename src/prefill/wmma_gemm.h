@@ -45,3 +45,14 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 bool strata_wmma_gemm_bf16(const uint16_t* X, const uint16_t* W, float* Y,
                            int64_t T, int64_t N, int64_t K, int64_t ldy, float beta,
                            void* stream = nullptr);
+
+// SKINNY (T <= strata_skinny_max_t(), default 128; STRATA_SKINNY_MAX_T=0 off): the short read's projections with the
+// weights streamed once and split-K to fill the GPU.  false: not taken (shape, alignment, device) - fall through.
+bool strata_skinny_gemm_f16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream = nullptr);
+bool strata_skinny_gemm_bf16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                             int64_t N, int64_t K, int64_t ldy, float beta, void* stream = nullptr);
+int strata_skinny_max_t();
+// ... on the native GGUF blocks (Q6_K, Q4_K, IQ4_XS, IQ4_NL), dequantized in registers: no FP16 image needed.
+bool strata_skinny_gemm_native(const uint16_t* X, int64_t ldx, int ggml_type, const void* W, float* Y, int64_t T,
+                               int64_t N, int64_t K, int64_t ldy, float beta, void* stream = nullptr);

@@ -17,6 +17,9 @@
 //       2. gemm_wmma_16x16_1w: 1 wave (32 threads), 16T x 16N x 16K tile, zero LDS/barriers, for small T/N.
 
 #include "wmma_gemm.h"
+#include <algorithm>
+#include <mutex>
+#include <map>
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -707,8 +710,442 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
     return hipGetLastError() == hipSuccess;
 }
 
+// ===========================================================================
+// SKINNY (T <= 128 rows, the short prompt read): Y[t, n] (+)= sum_k W[n, k] X[t, k] with the weights streamed ONCE.
+// A short read's projections are weight-bound (every weight byte meets at most 128 tokens), and the tiled kernels
+// above and hipBLASLt leave most of the bandwidth unused at a handful of rows - or launch 20 waves for a 320-column
+// product with K = 10240.  Here a wave owns 16 output columns and every row (MT 16-row tiles, the B fragment reused
+// for all of them), reads its W rows KU x 32 bytes at a time per lane, and the K range is split across blocks until
+// the grid has enough waves to keep the memory busy; the splits' partial sums go to a workspace and one kernel adds
+// them in split order (deterministic).  FP32 accumulation, K in its own order: rounding-level against hipBLASLt.
+// ===========================================================================
+namespace skinny {
+constexpr int WPB = 4;     // waves per block
+constexpr int KU = 4;      // 16-wide K steps per W load (128 bytes of a row per lane)
+
+template <typename ElemT, int MT>
+__global__ void __launch_bounds__(32 * WPB) kernel(const uint16_t* __restrict__ X, int ldx, const uint16_t* __restrict__ W,
+                                                   int ldw, float* __restrict__ Y, int ldy, float* __restrict__ part,
+                                                   int T, int N, int K, int kchunk, float beta) {
+    using vec_t = typename WmmaTraits<ElemT>::vec_t;
+    const int lane = threadIdx.x & 31, lane_lo = lane & 15, lane_hi = lane >> 4;
+    const int n0 = (blockIdx.x * WPB + (threadIdx.x >> 5)) * 16;
+    if (n0 >= N) return;
+    const int kb = blockIdx.y * kchunk, ke = min(K, kb + kchunk);
+    v8fp32 acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = v8fp32{0, 0, 0, 0, 0, 0, 0, 0};
+    const int n_row = n0 + lane_lo;
+    const bool n_ok = n_row < N;
+    const uint16_t* wrow = W + (int64_t) (n_ok ? n_row : 0) * ldw;
+    for (int k = kb; k < ke; k += 16 * KU) {
+        vec_t b[KU];
+#pragma unroll
+        for (int u = 0; u < KU; ++u) {
+            if (n_ok && k + 16 * u < ke) __builtin_memcpy(&b[u], wrow + k + 16 * u, sizeof(vec_t));
+            else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) b[u][i] = 0;
+            }
+        }
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            const int t = m * 16 + lane_lo;
+            const uint16_t* xrow = X + (int64_t) (t < T ? t : 0) * ldx;
+#pragma unroll
+            for (int u = 0; u < KU; ++u) {
+                vec_t a;
+                if (t < T && k + 16 * u < ke) __builtin_memcpy(&a, xrow + k + 16 * u, sizeof(vec_t));
+                else {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) a[i] = 0;
+                }
+                acc[m] = WmmaTraits<ElemT>::mma(a, b[u], acc[m]);
+            }
+        }
+    }
+    if (!n_ok) return;
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int t = m * 16 + 2 * i + lane_hi;
+            if (t >= T) continue;
+            if (part) {
+                part[((int64_t) blockIdx.y * T + t) * N + n_row] = acc[m][i];
+            } else {
+                float* dst = Y + (int64_t) t * ldy + n_row;
+                *dst = beta == 0.0f ? acc[m][i] : beta * *dst + acc[m][i];
+            }
+        }
+    }
+}
+
+__global__ void reduce(const float* __restrict__ part, int splits, float* __restrict__ Y, int ldy, int T, int N,
+                       float beta) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) T * N) return;
+    const int t = (int) (i / N), n = (int) (i % N);
+    float s = 0.0f;
+    for (int k = 0; k < splits; ++k) s += part[((int64_t) k * T + t) * N + n];
+    float* dst = Y + (int64_t) t * ldy + n;
+    *dst = beta == 0.0f ? s : beta * *dst + s;
+}
+
+// the split partials' workspace, per stream (the prompt path's streams; grown once, never inside a capture)
+float* workspace(hipStream_t s, size_t bytes) {
+    static std::mutex mu;
+    static std::map<hipStream_t, std::pair<float*, size_t>> ws;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& e = ws[s];
+    if (e.second < bytes) {
+        if (e.first) { hipStreamSynchronize(s); hipFree(e.first); }
+        e = {nullptr, 0};
+        const size_t want = std::max<size_t>(bytes, (size_t) 16 << 20);
+        if (hipMalloc((void**) &e.first, want) != hipSuccess) { e.first = nullptr; return nullptr; }
+        e.second = want;
+    }
+    return e.first;
+}
+
+int max_t() {   // STRATA_SKINNY_MAX_T: the largest chunk this takes (0 = off); 128 by default
+    static const int v = [] { const char* e = std::getenv("STRATA_SKINNY_MAX_T"); return e ? std::atoi(e) : 128; }();
+    return std::min(v, 128);
+}
+
+template <typename ElemT>
+bool run(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T, int64_t N, int64_t K,
+         int64_t ldy, float beta, void* stream) {
+    if (!X || !W || !Y || T <= 0 || N <= 0 || K <= 0 || T > max_t() || K % 16 != 0 || ldx % 8 != 0 || ldw % 8 != 0 ||
+        (beta != 0.0f && beta != 1.0f) || (reinterpret_cast<uintptr_t>(X) & 15) || (reinterpret_cast<uintptr_t>(W) & 15))
+        return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    if (ldy <= 0) ldy = N;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int64_t waves_n = (N + 15) / 16, blocks_n = (waves_n + WPB - 1) / WPB;
+    static const int64_t target = [] { const char* e = std::getenv("STRATA_SKINNY_WAVES"); return e ? std::atoll(e) : (int64_t) 640; }();
+    const int64_t step = 16 * KU;
+    int64_t splits = std::max<int64_t>(1, std::min<int64_t>((target + waves_n - 1) / waves_n, (K + step - 1) / step));
+    int64_t kchunk = ((K + splits - 1) / splits + step - 1) / step * step;
+    splits = (K + kchunk - 1) / kchunk;
+    float* part = nullptr;
+    if (splits > 1) {
+        part = workspace(s, (size_t) (splits * T * N) * sizeof(float));
+        if (!part) return false;
+    }
+    const dim3 grid((unsigned) blocks_n, (unsigned) splits);
+    const int mt = (int) ((T + 15) / 16);
+#define SK(MT) kernel<ElemT, MT><<<grid, 32 * WPB, 0, s>>>(X, (int) ldx, W, (int) ldw, Y, (int) ldy, part, (int) T, (int) N, \
+                                                         (int) K, (int) kchunk, beta)
+    switch (mt) {
+        case 1: SK(1); break; case 2: SK(2); break; case 3: SK(3); break; case 4: SK(4); break;
+        case 5: SK(5); break; case 6: SK(6); break; case 7: SK(7); break; default: SK(8); break;
+    }
+#undef SK
+    if (splits > 1) {
+        const int64_t n = T * N;
+        reduce<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, (int) splits, Y, (int) ldy, (int) T, (int) N, beta);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+}  // namespace skinny
+
+// SKINNY on the GGUF blocks themselves (Q6_K, Q4_K, IQ4_XS, IQ4_NL - the dense projections of the IQ3_S pack): each
+// lane dequantizes 64 values of its weight row per step into four FP16 B fragments, in registers (llama.cpp's
+// formulas, the values the FP16 image holds), so a short read streams the native bytes - 1.9 GB for the dense set
+// against 5.3 GB as FP16 - and needs no FP16 copy of the weights at all.
+namespace skinny {
+static __constant__ int8_t kIq4nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+using h16 = _Float16 __attribute__((ext_vector_type(16)));
+__device__ __forceinline__ float ldh(const uint8_t* p) { _Float16 h; __builtin_memcpy(&h, p, 2); return (float) h; }
+
+// Each type: kofs(g, k) - the K offsets of group g's four 16-value fragments; half(row, g, h, b) - fragments 2h and
+// 2h + 1 of the group (the two halves of a wave dequantize one pair each and swap them: permlanex16 below).
+struct Q6K {   // 210 bytes / 256: ql[128] qh[64] scales[16] d
+    static constexpr int QK = 256, BYTES = 210;
+    __device__ static void kofs(int g, int k[4]) {
+        const int sb = g >> 2, sub = g & 3, n = sub >> 1, part = sub & 1;
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 256 * sb + 128 * n + 32 * (part + 2 * (f >> 1)) + 16 * (f & 1);
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const int sb = g >> 2, sub = g & 3, n = sub >> 1, part = sub & 1, jj = part + 2 * h;
+        const uint8_t* x = row + (int64_t) sb * BYTES;
+        uint8_t ql[32], qh[32];
+        int8_t sc[2];
+        __builtin_memcpy(ql, x + 64 * n + 32 * part, 32);
+        __builtin_memcpy(qh, x + 128 + 32 * n, 32);
+        __builtin_memcpy(sc, x + 192 + 8 * n + 2 * jj, 2);
+        const float d = ldh(x + 208);
+        const int nsh = 4 * h, qsh = 2 * jj;
+#pragma unroll
+        for (int is = 0; is < 2; ++is) {
+            const float ds = d * (float) sc[is];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int l = 16 * is + i;
+                const int q = (int) (((ql[l] >> nsh) & 0xF) | (((qh[l] >> qsh) & 3) << 4)) - 32;
+                b[is][i] = (_Float16) (ds * (float) q);
+            }
+        }
+    }
+};
+struct Q4K {   // 144 bytes / 256: d dmin scales[12] qs[128]
+    static constexpr int QK = 256, BYTES = 144;
+    __device__ static void kofs(int g, int k[4]) {
+        const int sb = g >> 2, c = g & 3;
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 256 * sb + 64 * c + 16 * f;
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const int sb = g >> 2, c = g & 3, j = 2 * c + h;
+        const uint8_t* x = row + (int64_t) sb * BYTES;
+        uint8_t qs[32], scl[12];
+        __builtin_memcpy(qs, x + 16 + 32 * c, 32);
+        __builtin_memcpy(scl, x + 4, 12);
+        const float d = ldh(x), dmin = ldh(x + 2);
+        uint8_t sc, m;
+        if (j < 4) { sc = scl[j] & 63; m = scl[j + 4] & 63; }
+        else { sc = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4); m = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4); }
+        const float d1 = d * sc, m1 = dmin * m;
+        const int sh = 4 * h;
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh)
+#pragma unroll
+            for (int i = 0; i < 16; ++i) b[hh][i] = (_Float16) (d1 * (float) ((qs[16 * hh + i] >> sh) & 0xF) - m1);
+    }
+};
+struct Q5K {   // 176 bytes / 256: d dmin scales[12] qh[32] qs[128]
+    static constexpr int QK = 256, BYTES = 176;
+    __device__ static void kofs(int g, int k[4]) {
+        const int sb = g >> 2, c = g & 3;
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 256 * sb + 64 * c + 16 * f;
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const int sb = g >> 2, c = g & 3, j = 2 * c + h;
+        const uint8_t* x = row + (int64_t) sb * BYTES;
+        uint8_t qs[32], qh[32], scl[12];
+        __builtin_memcpy(qs, x + 48 + 32 * c, 32);
+        __builtin_memcpy(qh, x + 16, 32);
+        __builtin_memcpy(scl, x + 4, 12);
+        const float d = ldh(x), dmin = ldh(x + 2);
+        uint8_t sc, m;
+        if (j < 4) { sc = scl[j] & 63; m = scl[j + 4] & 63; }
+        else { sc = (scl[j + 4] & 0xF) | ((scl[j - 4] >> 6) << 4); m = (scl[j + 4] >> 4) | ((scl[j] >> 6) << 4); }
+        const float d1 = d * sc, m1 = dmin * m;
+        const int sh = 4 * h, hb = 2 * c + h;
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh)
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int l = 16 * hh + i;
+                const int q = ((qs[l] >> sh) & 0xF) + (((qh[l] >> hb) & 1) << 4);
+                b[hh][i] = (_Float16) (d1 * (float) q - m1);
+            }
+    }
+};
+struct Q80 {   // 34 bytes / 32: d qs[32]
+    static constexpr int QK = 32, BYTES = 34;
+    __device__ static void kofs(int g, int k[4]) {
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 64 * g + 16 * f;
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const uint8_t* x = row + (int64_t) (2 * g + h) * BYTES;
+        int8_t qs[32];
+        __builtin_memcpy(qs, x + 2, 32);
+        const float d = ldh(x);
+#pragma unroll
+        for (int hh = 0; hh < 2; ++hh)
+#pragma unroll
+            for (int i = 0; i < 16; ++i) b[hh][i] = (_Float16) (d * (float) qs[16 * hh + i]);
+    }
+};
+struct IQ4XS {   // 136 bytes / 256: d scales_h scales_l[4] qs[128]
+    static constexpr int QK = 256, BYTES = 136;
+    __device__ static void kofs(int g, int k[4]) {
+        const int sb = g >> 2, sub = g & 3;
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 256 * sb + 64 * sub + 16 * f;
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const int sb = g >> 2, sub = g & 3, ib = 2 * sub + h;
+        const uint8_t* x = row + (int64_t) sb * BYTES;
+        uint8_t qs[16];
+        uint16_t sh;
+        __builtin_memcpy(qs, x + 8 + 16 * ib, 16);
+        __builtin_memcpy(&sh, x + 2, 2);
+        const uint8_t sl = x[4 + sub];
+        const int ls = ((sl >> (4 * h)) & 0xf) | (((sh >> (2 * ib)) & 3) << 4);
+        const float dl = ldh(x) * (float) (ls - 32);
+#pragma unroll
+        for (int hi = 0; hi < 2; ++hi)
+#pragma unroll
+            for (int i = 0; i < 16; ++i) b[hi][i] = (_Float16) (dl * (float) kIq4nl[(qs[i] >> (4 * hi)) & 0xF]);
+    }
+};
+struct IQ4NL {   // 18 bytes / 32: d qs[16]
+    static constexpr int QK = 32, BYTES = 18;
+    __device__ static void kofs(int g, int k[4]) {
+#pragma unroll
+        for (int f = 0; f < 4; ++f) k[f] = 64 * g + 16 * f;
+    }
+    __device__ static void half(const uint8_t* row, int g, int h, h16 b[2]) {
+        const uint8_t* x = row + (int64_t) (2 * g + h) * BYTES;
+        uint8_t qs[16];
+        __builtin_memcpy(qs, x + 2, 16);
+        const float d = ldh(x);
+#pragma unroll
+        for (int hi = 0; hi < 2; ++hi)
+#pragma unroll
+            for (int i = 0; i < 16; ++i) b[hi][i] = (_Float16) (d * (float) kIq4nl[(qs[i] >> (4 * hi)) & 0xF]);
+    }
+};
+
+// the other half-wave's value of v (lane l <-> lane l ^ 16)
+__device__ __forceinline__ uint32_t swap16(uint32_t v) {
+    return (uint32_t) __builtin_amdgcn_permlanex16((int) v, (int) v, 0x76543210, 0xfedcba98, false, false);
+}
+
+template <typename Q, int MT>
+__global__ void __launch_bounds__(32 * WPB) kernel_q(const uint16_t* __restrict__ X, int ldx, const uint8_t* __restrict__ W,
+                                                     int64_t row_bytes, float* __restrict__ Y, int ldy,
+                                                     float* __restrict__ part, int T, int N, int groups, int gchunk,
+                                                     float beta) {
+    const int lane = threadIdx.x & 31, lane_lo = lane & 15, lane_hi = lane >> 4;
+    const int n0 = (blockIdx.x * WPB + (threadIdx.x >> 5)) * 16;
+    if (n0 >= N) return;
+    const int gb = blockIdx.y * gchunk, ge = min(groups, gb + gchunk);
+    v8fp32 acc[MT];
+#pragma unroll
+    for (int m = 0; m < MT; ++m) acc[m] = v8fp32{0, 0, 0, 0, 0, 0, 0, 0};
+    const int n_row = n0 + lane_lo;
+    const bool n_ok = n_row < N;
+    const uint8_t* wrow = W + (int64_t) (n_ok ? n_row : 0) * row_bytes;
+    for (int g = gb; g < ge; ++g) {
+        int k[4];
+        Q::kofs(g, k);
+        h16 mine[2], b[4];
+        Q::half(wrow, g, lane_hi, mine);
+        if (!n_ok) {
+#pragma unroll
+            for (int f = 0; f < 2; ++f)
+#pragma unroll
+                for (int i = 0; i < 16; ++i) mine[f][i] = 0;
+        }
+#pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            uint32_t w[8], o[8];
+            __builtin_memcpy(w, &mine[f], 32);
+#pragma unroll
+            for (int d = 0; d < 8; ++d) o[d] = swap16(w[d]);
+            h16 other;
+            __builtin_memcpy(&other, o, 32);
+            b[f] = lane_hi ? other : mine[f];       // fragments 0, 1: the low half's
+            b[2 + f] = lane_hi ? mine[f] : other;   // fragments 2, 3: the high half's
+        }
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+            const int t = m * 16 + lane_lo;
+            const uint16_t* xrow = X + (int64_t) (t < T ? t : 0) * ldx;
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                h16 a;
+                if (t < T) __builtin_memcpy(&a, xrow + k[f], sizeof(h16));
+                else {
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) a[i] = 0;
+                }
+                acc[m] = WmmaTraits<_Float16>::mma(a, b[f], acc[m]);
+            }
+        }
+    }
+    if (!n_ok) return;
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int t = m * 16 + 2 * i + lane_hi;
+            if (t >= T) continue;
+            if (part) {
+                part[((int64_t) blockIdx.y * T + t) * N + n_row] = acc[m][i];
+            } else {
+                float* dst = Y + (int64_t) t * ldy + n_row;
+                *dst = beta == 0.0f ? acc[m][i] : beta * *dst + acc[m][i];
+            }
+        }
+    }
+}
+
+template <typename Q>
+bool run_q(const uint16_t* X, int64_t ldx, const void* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+           float beta, void* stream) {
+    if (!X || !W || !Y || T <= 0 || N <= 0 || T > max_t() || K % Q::QK != 0 || K % 64 != 0 || ldx % 8 != 0 ||
+        (beta != 0.0f && beta != 1.0f) || (reinterpret_cast<uintptr_t>(X) & 15))
+        return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    if (ldy <= 0) ldy = N;
+    hipStream_t s = static_cast<hipStream_t>(stream);
+    const int64_t row_bytes = K / Q::QK * Q::BYTES, groups = K / 64;
+    const int64_t waves_n = (N + 15) / 16, blocks_n = (waves_n + WPB - 1) / WPB;
+    static const int64_t target = [] { const char* e = std::getenv("STRATA_SKINNY_WAVES"); return e ? std::atoll(e) : (int64_t) 640; }();
+    int64_t splits = std::max<int64_t>(1, std::min<int64_t>((target + waves_n - 1) / waves_n, groups));
+    const int64_t gchunk = (groups + splits - 1) / splits;
+    splits = (groups + gchunk - 1) / gchunk;
+    float* part = nullptr;
+    if (splits > 1) {
+        part = workspace(s, (size_t) (splits * T * N) * sizeof(float));
+        if (!part) return false;
+    }
+    const dim3 grid((unsigned) blocks_n, (unsigned) splits);
+    const int mt = (int) ((T + 15) / 16);
+#define SKQ(MT) kernel_q<Q, MT><<<grid, 32 * WPB, 0, s>>>(X, (int) ldx, (const uint8_t*) W, row_bytes, Y, (int) ldy, part, \
+                                                         (int) T, (int) N, (int) groups, (int) gchunk, beta)
+    switch (mt) {
+        case 1: SKQ(1); break; case 2: SKQ(2); break; case 3: SKQ(3); break; case 4: SKQ(4); break;
+        case 5: SKQ(5); break; case 6: SKQ(6); break; case 7: SKQ(7); break; default: SKQ(8); break;
+    }
+#undef SKQ
+    if (splits > 1) {
+        const int64_t n = T * N;
+        reduce<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(part, (int) splits, Y, (int) ldy, (int) T, (int) N, beta);
+    }
+    return hipGetLastError() == hipSuccess;
+}
+}  // namespace skinny
+
+bool strata_skinny_gemm_native(const uint16_t* X, int64_t ldx, int ggml_type, const void* W, float* Y, int64_t T,
+                               int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    switch (ggml_type) {
+        case 14: return skinny::run_q<skinny::Q6K>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        case 12: return skinny::run_q<skinny::Q4K>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        case 13: return skinny::run_q<skinny::Q5K>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        case 8: return skinny::run_q<skinny::Q80>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        case 23: return skinny::run_q<skinny::IQ4XS>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        case 20: return skinny::run_q<skinny::IQ4NL>(X, ldx, W, Y, T, N, K, ldy, beta, stream);
+        default: return false;
+    }
+}
+bool strata_skinny_gemm_f16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    return skinny::run<_Float16>(X, ldx, W, ldw, Y, T, N, K, ldy, beta, stream);
+}
+bool strata_skinny_gemm_bf16(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                             int64_t N, int64_t K, int64_t ldy, float beta, void* stream) {
+    return skinny::run<__bf16>(X, ldx, W, ldw, Y, T, N, K, ldy, beta, stream);
+}
+int strata_skinny_max_t() { return skinny::max_t(); }
+
 #else
 // Non-HIP / Non-GFX11 compilation fallback
+bool strata_skinny_gemm_f16(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t, int64_t,
+                            float, void*) { return false; }
+bool strata_skinny_gemm_bf16(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t, int64_t,
+                             float, void*) { return false; }
+int strata_skinny_max_t() { return 0; }
+bool strata_skinny_gemm_native(const uint16_t*, int64_t, int, const void*, float*, int64_t, int64_t, int64_t, int64_t,
+                               float, void*) { return false; }
 bool strata_pf_gemm_f16(const uint16_t*, const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, float, void*) {
     return false;
 }

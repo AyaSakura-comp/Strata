@@ -570,12 +570,67 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 #endif
 }
 
+// STRATA_SKINNY_CHECK=N (test): the first N skinny products also run on hipBLASLt (the path they replace) and the
+// difference is printed; the hipBLASLt result is the one kept.
+int Gemm::skinny_check_left() {
+    if (skinny_left_ < 0) {
+        const char* e = std::getenv("STRATA_SKINNY_CHECK");
+        skinny_left_ = e ? std::max(0, std::atoi(e)) : 0;
+    }
+    return skinny_left_;
+}
+bool Gemm::skinny_compare(bool bf, const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                          int64_t K, int64_t ldy) {
+#if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
+    float* tmp = nullptr;
+    if (cudaMalloc((void**) &tmp, (size_t) (T * N) * 4) != cudaSuccess) return false;
+    const bool ok = bf ? strata_skinny_gemm_bf16(X, ldx, W, K, tmp, T, N, K, N, 0.0f, stream_)
+                       : strata_skinny_gemm_f16(X, ldx, W, K, tmp, T, N, K, N, 0.0f, stream_);
+    if (!ok) { cudaFree(tmp); return false; }
+    const float alpha = 1.0f, beta = 0.0f;
+    const bool ref = try_hipblaslt(hipblaslt_state_, bf ? strata::prefill::hipblaslt::InputType::bf16
+                                                        : strata::prefill::hipblaslt::InputType::f16,
+                                   X, W, Y, T, N, K, ldy, 0.0f, stream_, ldx == K ? 0 : ldx);
+    if (!ref)
+        ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                        bf ? CUDA_R_16BF : CUDA_R_16F, (int) K, X, bf ? CUDA_R_16BF : CUDA_R_16F, (int) ldx, &beta, Y,
+                        CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+           "cublasGemmEx (skinny check)");
+    std::vector<float> a((size_t) (T * N)), b((size_t) (T * ldy));
+    cudaMemcpyAsync(a.data(), tmp, a.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream_);
+    cudaMemcpyAsync(b.data(), Y, b.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream_);
+    cudaStreamSynchronize((cudaStream_t) stream_);
+    cudaFree(tmp);
+    double dot = 0, na = 0, nb = 0, emax = 0, bmax = 0;
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t n = 0; n < N; ++n) {
+            const double x = a[(size_t) (t * N + n)], y = b[(size_t) (t * ldy + n)];
+            dot += x * y; na += x * x; nb += y * y;
+            emax = std::max(emax, std::fabs(x - y)); bmax = std::max(bmax, std::fabs(y));
+        }
+    std::fprintf(stderr, "strata skinny check (%s T=%lld N=%lld K=%lld): cos %.9f, max |diff| %.3e of max |y| %.3e\n",
+                 bf ? "bf16" : "f16", (long long) T, (long long) N, (long long) K,
+                 na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 1.0, emax, bmax);
+    --skinny_left_;
+    return true;
+#else
+    (void) bf; (void) X; (void) ldx; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    return false;
+#endif
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
 #ifdef STRATA_USE_HIP
+    if (!f16_io_ && T <= strata_skinny_max_t() && beta == 0.0f && skinny_check_left() > 0) {
+        if (skinny_compare(true, X, ldx ? ldx : K, W, Y, T, N, K, ldy)) return;
+    } else if (!f16_io_ && T <= strata_skinny_max_t() &&
+               strata_skinny_gemm_bf16(X, ldx ? ldx : K, W, K, Y, T, N, K, ldy, beta, stream_)) {
+        return;
+    }
     // #313 (opt-in STRATA_WMMA_GEMM=1; STRATA_WMMA_BF16=0 excludes bf16): RDNA3 / RDNA3.5 WMMA dense GEMM, before
     // hipBLASLt; it returns false for shapes it does not take (and off gfx11) and this falls through
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
@@ -655,6 +710,12 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #ifdef STRATA_USE_HIP
+    // a short read (T <= 128): the skinny kernel streams the weights once (wmma_gemm.cu)
+    if (T <= strata_skinny_max_t() && beta == 0.0f && skinny_check_left() > 0) {
+        if (skinny_compare(false, X, K, W, Y, T, N, K, ldy)) return;
+    } else if (T <= strata_skinny_max_t() && strata_skinny_gemm_f16(X, K, W, K, Y, T, N, K, ldy, beta, stream_)) {
+        return;
+    }
     // #313 (opt-in STRATA_WMMA_GEMM=1): RDNA3 / RDNA3.5 WMMA dense GEMM, before hipBLASLt (falls through when false)
     static const bool wmma_on = [] { const char* v = std::getenv("STRATA_WMMA_GEMM"); return v && v[0] != 0 && v[0] != '0'; }();
     static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
@@ -814,6 +875,45 @@ const uint16_t* Gemm::f16_cached(int ggml_type, const void* W_blocks, int64_t N,
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
 #ifdef STRATA_USE_HIP
+    // a short read (T <= 128): the GGUF blocks dequantized in the skinny kernel's registers - no FP16 image, no scratch
+    // pass (STRATA_SKINNY_NATIVE=0: the FP16 paths below)
+    static const bool skinny_native = [] { const char* v = std::getenv("STRATA_SKINNY_NATIVE"); return !v || v[0] != '0'; }();
+    if (skinny_native && T <= strata_skinny_max_t()) {
+        const int64_t lx = ldx > 0 ? ldx : K;
+        if (beta == 0.0f && skinny_check_left() > 0 && N * K <= scratch_elems_) {
+            float* tmp = nullptr;
+            if (cudaMalloc((void**) &tmp, (size_t) (T * N) * 4) == cudaSuccess &&
+                strata_skinny_gemm_native(X, lx, ggml_type, W_blocks, tmp, T, N, K, N, 0.0f, stream_)) {
+                strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
+                const float alpha = 1.0f, zero = 0.0f;
+                ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha,
+                                scratch_, CUDA_R_16F, (int) K, X, CUDA_R_16F, (int) lx, &zero, Y, CUDA_R_32F,
+                                (int) (ldy > 0 ? ldy : N), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                   "cublasGemmEx (skinny native check)");
+                const int64_t ly = ldy > 0 ? ldy : N;
+                std::vector<float> a((size_t) (T * N)), b((size_t) (T * ly));
+                cudaMemcpyAsync(a.data(), tmp, a.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream_);
+                cudaMemcpyAsync(b.data(), Y, b.size() * 4, cudaMemcpyDeviceToHost, (cudaStream_t) stream_);
+                cudaStreamSynchronize((cudaStream_t) stream_);
+                double dot = 0, na = 0, nb = 0, emax = 0, bmax = 0;
+                for (int64_t t = 0; t < T; ++t)
+                    for (int64_t n = 0; n < N; ++n) {
+                        const double x = a[(size_t) (t * N + n)], y = b[(size_t) (t * ly + n)];
+                        dot += x * y; na += x * x; nb += y * y;
+                        emax = std::max(emax, std::fabs(x - y)); bmax = std::max(bmax, std::fabs(y));
+                    }
+                std::fprintf(stderr, "strata skinny check (native type %d T=%lld N=%lld K=%lld): cos %.9f, max |diff| %.3e of max |y| %.3e\n",
+                             ggml_type, (long long) T, (long long) N, (long long) K,
+                             na > 0 && nb > 0 ? dot / std::sqrt(na * nb) : 1.0, emax, bmax);
+                --skinny_left_;
+                cudaFree(tmp);
+                return;
+            }
+            if (tmp) cudaFree(tmp);
+        } else if (strata_skinny_gemm_native(X, lx, ggml_type, W_blocks, Y, T, N, K, ldy, beta, stream_)) {
+            return;
+        }
+    }
     // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
     // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
     // channels (gemm_probe8: K 6144 19 -> 29 TFLOPS from W alone, 35 with X padded too).  Bitwise the same products.
