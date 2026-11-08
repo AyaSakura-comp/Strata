@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/conversation_snapshot.hpp"
 #include "mmq_resident_sort.hpp"
 #include "wmma_gemm.h"
 #include "strata/core/mtp.hpp"
@@ -678,7 +679,68 @@ void Prefill::reset() {
     stats_ = PrefillStats{};
 }
 
+void Prefill::snapshot_release() {
+    for (void* q : {(void*) snap_.gdn, (void*) snap_.ple, (void*) snap_.tail, (void*) snap_.dead, (void*) snap_.block_pos})
+        if (q) cudaFree(q);
+    snap_ = Snapshot{};
+}
+
+bool Prefill::arm_snapshot(int64_t pos, std::string& err) {
+    disarm_snapshot();
+    if (!impl_ || !impl_->ss || !impl_->g || pos < 1 || stage_lb_ != 0 || next_ != nullptr || hand_in_ != nullptr ||
+        (stage_le_ >= 0 && stage_le_ != impl_->g->n_layers))
+        return false;
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    if (!snap_.gdn) {
+        core::ConversationStateSizes z;
+        if (!core::conversation_session_sizes(*m.g, *m.ss, z, err)) return false;
+        const size_t q = (size_t) std::max<int64_t>(m.ss->qsa_alloc, 0);
+        snap_.gdn_bytes = z.gdn;
+        snap_.ple_bytes = m.ss->ple_hist ? z.ple : 0;
+        snap_.tail_bytes = z.tail;
+        snap_.dead_bytes = z.dead;
+        auto take = [&](void** p, size_t n) { return n == 0 || cudaMalloc(p, n) == cudaSuccess; };
+        if (!take((void**) &snap_.gdn, std::max<size_t>(snap_.gdn_bytes, 4)) || !take((void**) &snap_.ple, snap_.ple_bytes) ||
+            !take((void**) &snap_.tail, q * z.tail) || !take((void**) &snap_.dead, q * z.dead) ||
+            !take((void**) &snap_.block_pos, q * sizeof(int32_t))) {
+            snapshot_release();
+            err = "prefill: no device memory for the in-pass checkpoint";
+            return false;
+        }
+    }
+    snap_.pos = pos;
+    snap_.done = false;
+    return true;
+}
+
+bool Prefill::snapshot_checkpoint(core::ConversationCheckpoint& c, std::string& err) {
+    if (!snapshot_ready() || !impl_ || (int64_t) c.ids.size() != snap_.pos) {
+        err = "prefill: the in-pass checkpoint was not taken";
+        disarm_snapshot();
+        return false;
+    }
+    Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
+    disarm_snapshot();
+    if (cudaStreamSynchronize((cudaStream_t) m.cs) != cudaSuccess) { err = "prefill: in-pass checkpoint sync"; return false; }
+    const core::SessionState& ss = *m.ss;
+    core::SessionState sh = ss;   // the same session, its running state read from the snapshot's buffers
+    sh.gdn_state = snap_.gdn;
+    sh.ple_hist = ss.ple_hist ? snap_.ple : nullptr;
+    const size_t q = (size_t) std::max<int64_t>(ss.qsa_alloc, 0), o = (size_t) std::max<int64_t>(ss.qsa_ord0, 0);
+    std::vector<core::QsaState> qs(ss.qsa_states, ss.qsa_states + o + q);
+    for (size_t j = 0; j < q; ++j) {
+        qs[o + j].idx_tail = (float*) ((char*) snap_.tail + j * snap_.tail_bytes);
+        qs[o + j].idx_dead = (float*) ((char*) snap_.dead + j * snap_.dead_bytes);
+        qs[o + j].idx_block_pos = snap_.block_pos + j;
+    }
+    sh.qsa_states = qs.data();
+    return core::conversation_checkpoint_save(c, sh, *m.g, err);
+}
+
 void Prefill::release() {
+    snapshot_release();
     if (!impl_) return;
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
@@ -1795,6 +1857,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+        // arm_snapshot: this chunk holds the snapshot's position; the stateful kernels split T1 tokens in
+        const int64_t T1 = snap_.pos > p0 && snap_.pos <= p0 + T && !snap_.done ? snap_.pos - p0 : 0;
+        if (T1 > 0) snap_.done = true;   // the copies below are queued on m.cs; snapshot_checkpoint synchronizes
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         const auto tsetup = Clock::now();
@@ -2133,8 +2198,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 constexpr int64_t HD = strata::kernels::NG_HC_DIM;
                 const uint64_t per_token = (uint64_t) (3 * HD + N + 4) * 4 + (uint64_t) N * (bf16x2(m.f16_io) ? 4 : 2) + 4096;
                 const int64_t SB = std::min<int64_t>(T, (int64_t) (m.region_bytes / per_token));
-                for (int64_t s0 = 0; s0 < T; s0 += SB) {
-                    const int64_t nb = std::min(SB, T - s0);
+                for (int64_t s0 = 0, nb = 0; s0 < T; s0 += nb) {
+                    nb = std::min(SB, T - s0);
+                    if (T1 > s0 && s0 + nb > T1) nb = T1 - s0;   // in-pass snapshot: a sub-batch ends there
                     uint8_t* q = m.region;
                     auto carve_f = [&](size_t n) { float* p = (float*) q; q += (n * 4 + 255) & ~(size_t) 255; return p; };
                     float* key = carve_f((size_t) nb * HD);
@@ -2160,6 +2226,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         strata::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                                   gate, (int) nb, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
+                    if (T1 > 0 && s0 + nb == T1 && snap_.ple)
+                        cudaMemcpyAsync(snap_.ple, ss.ple.hist, snap_.ple_bytes, cudaMemcpyDeviceToDevice, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             } else if (l == 1 && ple_on) {
@@ -2174,6 +2242,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                    ss.ple.scratch, m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }
                     strata::kernels::ple_history_advance(ss.ple.hist, m.ple_norm, m.cs);
+                    if (T1 > 0 && t + 1 == T1 && snap_.ple)
+                        cudaMemcpyAsync(snap_.ple, ss.ple.hist, snap_.ple_bytes, cudaMemcpyDeviceToDevice, m.cs);
                 }
                 stats_.ms_ple += ms_since(tp);
             }
@@ -2263,11 +2333,30 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                    // in-pass snapshot: the conv history as it stands T1 tokens in (the history before the chunk,
+                    // advanced over T1 inputs), and the recurrence run in two walks with the state copied between
+                    const uint64_t rec_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    float* const snap_state =
+                        T1 > 0 && snap_.gdn ? snap_.gdn + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats : nullptr;
+                    if (snap_state)
+                        cudaMemcpyAsync(snap_state + rec_floats, conv, (size_t) (gdn_floats - rec_floats) * 4,
+                                        cudaMemcpyDeviceToDevice, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
+                    if (snap_state) gdn_conv_hist(snap_state + rec_floats, m.qkv, T1, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
-                                   ld_y);
+                    if (snap_state) {
+                        const int64_t ld = ld_y > 0 ? ld_y : ZV;
+                        gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T1,
+                                       m.cs, ld_y);
+                        cudaMemcpyAsync(snap_state, state, (size_t) rec_floats * 4, cudaMemcpyDeviceToDevice, m.cs);
+                        if (T > T1)
+                            gdn_recurrence(state, m.hbuf + T1 * C, m.gate + T1 * HV, m.beta + T1 * HV, m.z + T1 * ZV,
+                                           (const float*) wnm->data, EPS, m.y + T1 * ZV, m.y_h + T1 * ld, T - T1, m.cs, ld_y);
+                    } else {
+                        gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T,
+                                       m.cs, ld_y);
+                    }
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
@@ -2364,16 +2453,36 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
                     try {
                         static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
+                        // in-pass snapshot: the appends in two runs, the indexer's running state copied between
+                        const bool snap_q = T1 > 0 && snap_.tail != nullptr;
+                        auto snap_idx = [&]() {
+                            const size_t j = (size_t) (qsa_index - ss.qsa_ord0);
+                            cudaMemcpyAsync((char*) snap_.tail + j * snap_.tail_bytes, st.idx_tail, snap_.tail_bytes,
+                                            cudaMemcpyDeviceToDevice, m.cs);
+                            cudaMemcpyAsync((char*) snap_.dead + j * snap_.dead_bytes, st.idx_dead, snap_.dead_bytes,
+                                            cudaMemcpyDeviceToDevice, m.cs);
+                            cudaMemcpyAsync(snap_.block_pos + j, st.idx_block_pos, sizeof(int32_t), cudaMemcpyDeviceToDevice,
+                                            m.cs);
+                        };
                         if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, snap_q ? T1 : T, p0, 0,
+                                                                             (const float*) wikn->data, EPS, ib, s,
+                                                                             st.max_cells, strata::kernels::rope_scaling(),
+                                                                             m.cs);
+                            if (snap_q) {
+                                snap_idx();
+                                if (T > T1)
+                                    strata::kernels::native_qsa_indexer_append_batch(
+                                        m.idx_raw + T1 * 128, T - T1, p0 + T1, 0, (const float*) wikn->data, EPS, ib, s,
+                                        st.max_cells, strata::kernels::rope_scaling(), m.cs);
+                            }
                         }
                         for (int64_t t = 0; per_token && t < T; ++t) {
                             const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
                             strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
                                                                        (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                                        strata::kernels::rope_scaling(), m.cs);
+                            if (snap_q && t + 1 == T1) snap_idx();
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     pt.mark(kPfQsaSel, cs);

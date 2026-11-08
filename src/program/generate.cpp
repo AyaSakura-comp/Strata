@@ -6538,11 +6538,13 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool from_snapshot = false) -> bool {
             ckpt_why.clear();
-            if (o.prompt_cache <= 0 || L < 1) return true;
+            if (o.prompt_cache <= 0 || L < 1) { if (from_snapshot) sp.disarm_snapshot(); return true; }
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
+                    if (from_snapshot) sp.disarm_snapshot();
                     c.used = ++check_clock;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
@@ -6558,6 +6560,12 @@ int main(int argc, char** argv) {
                 c.dead = std::move((*parts)[0].dead);
                 c.block_pos = std::move((*parts)[0].block_pos);
                 for (size_t i = 1; i < parts->size(); ++i) c.stage_parts.push_back(std::move((*parts)[i]));
+            } else if (from_snapshot) {   // the running state the single pass copied out at L (Prefill::arm_snapshot)
+                std::string se;
+                if (!sp.snapshot_checkpoint(c, se)) {
+                    std::fprintf(stderr, "strata serve: in-pass checkpoint: %s\n", se.c_str());
+                    return false;
+                }
             } else {
                 if (!gpu_sync_ok() || !checkpoint_save(c, ss, g)) return false;
                 for (auto& st : stages) {   // a layer split's later stages: their sessions' part
@@ -8942,8 +8950,29 @@ int main(int argc, char** argv) {
             const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             int64_t at = read_from;
-            for (const int64_t to : {reread_to, root_at, message_at, turn_at, n - 1}) {
+            // ONE PASS: the new turn's two parts - the conversation up to its last turn boundary and the turn's header
+            // (+ a trailing effort turn) - would each pay the batched path's whole pass (every expert the part routes
+            // to, every projection read once): they are read in one pass instead, and the checkpoint at the boundary
+            // is the running state that pass copied out there (Prefill::arm_snapshot), the same state at the same
+            // position.  The verify windows still take a new turn short enough for them as a whole.
+            // STRATA_ONE_PASS=0: the two parts as before.
+            static const bool one_pass = [] { const char* e = std::getenv("STRATA_ONE_PASS"); return e == nullptr || std::atoi(e) != 0; }();
+            int64_t snap_ckpt = -1;
+            for (const int64_t to0 : {reread_to, root_at, message_at, turn_at, n - 1}) {
+                int64_t to = to0;
                 if (to <= at) continue;
+                if (to == turn_at && turn_at < n - 1 && one_pass && !multi_gpu && stages.empty() && o.prompt_cache > 0 &&
+                    !windows_ok(at, n - 1)) {
+                    std::string se;
+                    static const int snap_mode = [] { const char* e = std::getenv("STRATA_SNAPSHOT_CHECK"); return e ? std::atoi(e) : 0; }();
+                    const int64_t snap_pos = snap_mode == 3 ? n - 1 : turn_at;   // 3 (test): at the pass's end
+                    if (sp.arm_snapshot(snap_pos, se)) {
+                        snap_ckpt = snap_pos;
+                        to = n - 1;
+                    } else if (!se.empty()) {
+                        std::fprintf(stderr, "strata serve: one-pass read off for this prompt: %s\n", se.c_str());
+                    }
+                }
                 err.clear();
                 const bool win = windows_ok(at, to);
                 if (win && !refill(err)) {
@@ -8963,6 +8992,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
                 if (!sp_ok) {
+                    sp.disarm_snapshot();
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
@@ -8979,6 +9009,93 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
+                if (snap_ckpt >= 0 && to == n - 1) {
+                    if (!checkpoint_at(snap_ckpt, nullptr, false, true)) {
+                        std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
+                        return 1;
+                    }
+                    if (trace)
+                        std::fprintf(stderr, "strata trace: one pass of %lld tokens, checkpoint at %lld inside it\n",
+                                     (long long) (n - 1 - read_from), (long long) snap_ckpt);
+                    // STRATA_SNAPSHOT_CHECK=1 (test): the state the pass ends with (A), then the in-pass checkpoint put
+                    // back and the rest read again from it (B).  A snapshot that is the pass's own state at the boundary
+                    // gives B == A (up to the rows the second read's kernels group differently); a wrong one does not.
+                    // 2: the snapshot S against the state the old two-part read has there (L: the checkpoint the
+                    // read started from put back, its first part read on its own), then A against that read's end.
+                    // 3: the snapshot taken at the pass's end against the live state (must be the same bytes).
+                    static const int snap_check = [] { const char* e = std::getenv("STRATA_SNAPSHOT_CHECK"); return e ? std::atoi(e) : 0; }();
+                    if (snap_check > 0) {
+                        ConvCheckpoint a, b, l;
+                        a.ids.assign(cur.begin(), cur.begin() + (n - 1));
+                        b.ids = a.ids;
+                        l.ids.assign(cur.begin(), cur.begin() + snap_ckpt);
+                        const ConvCheckpoint *k = nullptr, *k0 = nullptr;
+                        for (const ConvCheckpoint& c : checks) {
+                            if ((int64_t) c.ids.size() == snap_ckpt) k = &c;
+                            if ((int64_t) c.ids.size() == read_from) k0 = &c;
+                        }
+                        std::string ce;
+                        bool ok = k != nullptr && gpu_sync_ok() && checkpoint_save(a, ss, g);
+                        if (ok && snap_check == 2) {
+                            ok = k0 != nullptr && checkpoint_restore(*k0, ss, g) &&
+                                 sp.run(ids.data() + read_from, snap_ckpt - read_from, read_from, ce) && gpu_sync_ok() &&
+                                 checkpoint_save(l, ss, g) &&
+                                 sp.run(ids.data() + snap_ckpt, n - 1 - snap_ckpt, snap_ckpt, ce) && gpu_sync_ok() &&
+                                 checkpoint_save(b, ss, g);
+                        } else if (ok && snap_check == 1) {
+                            ok = checkpoint_restore(*k, ss, g) &&
+                                 sp.run(ids.data() + snap_ckpt, n - 1 - snap_ckpt, snap_ckpt, ce) && gpu_sync_ok() &&
+                                 checkpoint_save(b, ss, g);
+                        }
+                        if (!ok) {
+                            std::fprintf(stderr, "strata snapshot check: could not run (%s)%s\n", ce.c_str(),
+                                         k0 == nullptr && snap_check == 2 ? " - no checkpoint where the read started" : "");
+                        } else if (snap_check == 3) {
+                            std::fprintf(stderr, "strata snapshot check 3 (at the pass's end, %lld tokens): snapshot vs live\n",
+                                         (long long) (n - 1 - read_from));
+                            auto same = [&](const char* what, const std::vector<uint8_t>& x, const std::vector<uint8_t>& y) {
+                                std::fprintf(stderr, "  %s: %zu bytes, %s\n", what, x.size(),
+                                             x.size() == y.size() && std::memcmp(x.data(), y.data(), x.size()) == 0 ? "identical" : "DIFFERENT");
+                            };
+                            same("gdn", k->gdn, a.gdn); same("ple", k->ple, a.ple); same("tails", k->tails, a.tails);
+                            same("dead", k->dead, a.dead); same("block_pos", k->block_pos, a.block_pos);
+                        } else {
+                            auto cmp = [](const char* what, const std::vector<uint8_t>& x, const std::vector<uint8_t>& y,
+                                          bool floats) {
+                                if (x.size() != y.size()) { std::fprintf(stderr, "  %s: size %zu vs %zu\n", what, x.size(), y.size()); return; }
+                                size_t diff = 0;
+                                double dot = 0, nx = 0, ny = 0, mx = 0;
+                                if (floats) {
+                                    const float* fx = (const float*) x.data(); const float* fy = (const float*) y.data();
+                                    for (size_t i = 0; i < x.size() / 4; ++i) {
+                                        if (std::memcmp(fx + i, fy + i, 4) != 0) ++diff;
+                                        dot += (double) fx[i] * fy[i]; nx += (double) fx[i] * fx[i]; ny += (double) fy[i] * fy[i];
+                                        mx = std::max(mx, (double) std::fabs(fx[i] - fy[i]));
+                                    }
+                                } else {
+                                    for (size_t i = 0; i < x.size(); ++i) diff += x[i] != y[i];
+                                }
+                                std::fprintf(stderr, "  %s: %zu bytes, %zu %s differ, cos %.9f, max |diff| %.3e\n", what, x.size(), diff,
+                                             floats ? "floats" : "bytes", floats && nx > 0 && ny > 0 ? dot / std::sqrt(nx * ny) : 1.0, mx);
+                            };
+                            std::fprintf(stderr, "strata snapshot check: pass of %lld tokens, checkpoint at %lld, re-read %lld:\n",
+                                         (long long) (n - 1 - read_from), (long long) snap_ckpt, (long long) (n - 1 - snap_ckpt));
+                            if (snap_check == 2) {
+                                std::fprintf(stderr, " S (in-pass) vs L (two-part read) at the boundary:\n");
+                                cmp("gdn", k->gdn, l.gdn, true); cmp("ple", k->ple, l.ple, true);
+                                cmp("tails", k->tails, l.tails, true); cmp("dead", k->dead, l.dead, true);
+                                cmp("block_pos", k->block_pos, l.block_pos, false);
+                                std::fprintf(stderr, " A (one pass) vs the two-part read's end:\n");
+                            }
+                            cmp("gdn", a.gdn, b.gdn, true);
+                            cmp("ple", a.ple, b.ple, true);
+                            cmp("tails", a.tails, b.tails, true);
+                            cmp("dead", a.dead, b.dead, true);
+                            cmp("block_pos", a.block_pos, b.block_pos, false);
+                        }
+                    }
+                    snap_ckpt = -1;
+                }
                 if ((to == turn_at || to == root_at || to == message_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());

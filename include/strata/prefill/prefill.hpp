@@ -10,6 +10,7 @@
 // Requires the native weights (`--native`): every quantized projection must carry its GGUF blocks.
 #pragma once
 
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -121,6 +122,20 @@ public:
 
     const PrefillStats& stats() const { return stats_; }
 
+    /// IN-PASS CHECKPOINT: the next run() copies the running state - the GDN recurrences and conv histories, the PLE
+    /// history, the QSA indexers' tails - as it stands at absolute position `pos` (inside one of its chunks or at a
+    /// chunk's end) into device buffers of its own.  Only the stateful kernels split at `pos` (each is a walk over
+    /// the tokens, so the two halves give the bits one call gives); every projection, the experts and attention run
+    /// on the whole chunk.  A short new turn is then read in ONE pass, and the conversation checkpoint at its turn
+    /// boundary still exists.  One stage, one GPU (false otherwise: the caller reads in two parts as before).
+    bool arm_snapshot(int64_t pos, std::string& err);
+    void disarm_snapshot() { snap_.pos = -1; snap_.done = false; }
+    bool snapshot_ready() const { return snap_.pos >= 0 && snap_.done; }
+    int64_t snapshot_pos() const { return snap_.pos; }
+    /// The snapshot as a conversation checkpoint's running state (the caller sets `c.ids` to its `pos` tokens first);
+    /// synchronizes the prefill stream, then disarms.
+    bool snapshot_checkpoint(core::ConversationCheckpoint& c, std::string& err);
+
     /// multi-GPU: the experts the peer GPU holds are computed THERE for every prompt chunk (up to `cap_rows` routed
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
@@ -186,6 +201,17 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
+    struct Snapshot {
+        int64_t pos = -1;             ///< armed: the absolute position, -1 off
+        bool done = false;            ///< the run that held `pos` copied it
+        float* gdn = nullptr;         ///< ss.gdn_state's layout (gdn_alloc rows)
+        float* ple = nullptr;         ///< ss.ple_hist's layout
+        float* tail = nullptr;        ///< per owned QSA layer: (idx_block - 1) x idx_dim
+        float* dead = nullptr;        ///< per owned QSA layer: idx_dim
+        int32_t* block_pos = nullptr; ///< per owned QSA layer
+        size_t gdn_bytes = 0, ple_bytes = 0, tail_bytes = 0, dead_bytes = 0;
+    } snap_;
+    void snapshot_release();
 };
 
 }  // namespace strata::prefill
