@@ -154,10 +154,29 @@ def random_text(rng, n_pieces=40):
 
 def encode_with(tok, text, parse_special, heap_min):
     tok.HEAP_MIN = heap_min
+    tok.clear_cache()                               # or the second path would read the first one's cached ids
     try:
         return tok.encode(text, parse_special=parse_special)
     finally:
         del tok.HEAP_MIN
+        tok.clear_cache()
+
+
+def uncached_encode(tok, text, parse_special):
+    """encode() without the segment and piece caches: the literals, then BPE of every piece."""
+    import strata_tokenizer as ST
+    pat = tok._special_re if parse_special else tok._always_re
+
+    def plain(s):
+        out = []
+        for piece in tok._re.findall(s):
+            out += [tok.ids[t] for t in tok._bpe("".join(ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8")))]
+        return out
+    out, pos = [], 0
+    for m in (pat.finditer(text) if pat is not None else ()):
+        out += plain(text[pos:m.start()]) + [tok.special_tokens[m.group(0)]]
+        pos = m.end()
+    return out + plain(text[pos:])
 
 
 def synthetic_tokenizer(seed=268, n_merges=1500):
@@ -230,6 +249,28 @@ class HeapBpe(unittest.TestCase):
                  "!function(e){var t={};function n(r){if(t[r])return t[r].exports}}" * 30,
                  "<|im_start|>user\n日本語" * 40 + "<|im_end|><think>" + "漢" * 300]
         self.parity(tok, fixed + [random_text(rng) for _ in range(40)])
+
+    def test_cache_parity(self):
+        """The segment and piece caches return what an encode without them does: a prompt that grows by text
+        appended to its last segment (a research warm), segments and pieces seen before, short ones - and with the
+        bounds small enough that segments are evicted and the piece dict is dropped."""
+        tok = synthetic_tokenizer()
+        rng = random.Random(5)
+        head = "<|im_start|>system\n" + random_text(rng, 40) + "<|im_end|>\n<|im_start|>user\n" + random_text(rng, 3)
+        body = random_text(rng, 30)
+        texts = [head + body[:k] for k in range(0, len(body), max(1, len(body) // 25))]
+        texts += [random_text(rng, rng.randint(1, 12)) for _ in range(40)] + [head] * 3
+        for small in (False, True):
+            if small:
+                tok.SEG_ENTRIES, tok.SEG_CHARS, tok.PIECE_MAX = 2, 4000, 50
+            tok.clear_cache()
+            for k, text in enumerate(texts * 2):    # the second pass reads what the first one cached
+                for ps in (False, True):
+                    self.assertEqual(tok.encode(text, parse_special=ps), uncached_encode(tok, text, ps),
+                                     f"text {k} parse_special={ps} small bounds={small}")
+            self.assertTrue(tok._segs and tok._pieces)
+        for name in ("SEG_ENTRIES", "SEG_CHARS", "PIECE_MAX"):
+            del tok.__dict__[name]
 
     def check_speed(self, tok):
         rng = random.Random(4)

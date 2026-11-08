@@ -578,6 +578,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_gen0 = False            # the engine takes GEN 0: the prompt read, no window (READY <ctx> ... gen0)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -623,6 +624,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_gen0 = "gen0" in f[2:]      # GEN 0 reads the prompt only (a warm: no window)
                 break
         loading.set()
         if self.max_context <= 0:
@@ -3068,7 +3070,9 @@ class Service:
                             owner = self.slot_owner_now()
                         self.slot_handover(owner)
                         # a warm is text the next warm extends; a chat prompt ends with turns its next prompt redoes
-                        self.slot_held = list(ids) if warm else self.conversation_prefix(ids)
+                        # (GEN 0 leaves the prompt's last token unread: the engine's state ends one before it)
+                        self.slot_held = (list(ids[:-1]) if max_new == 0 else list(ids)) if warm \
+                            else self.conversation_prefix(ids)
                         self.slot_held_warm = bool(warm)
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
@@ -4443,7 +4447,10 @@ def make_handler(svc: Service):
             room = ctx - CTX_SLACK - len(ids)
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room in the context ({ctx})")
-            max_new = 1 if n_predict == 0 else min(n_predict, room) if n_predict > 0 else room
+            # a warm on an engine that takes GEN 0 runs no window: it read the prompt's last token and wrote a token
+            # nobody gets (~37 ms between two warms of a research call); the next request reads that token instead
+            gen0 = n_predict == 0 and getattr(svc.engine, "can_gen0", False)
+            max_new = (0 if gen0 else 1) if n_predict == 0 else min(n_predict, room) if n_predict > 0 else room
             cancel = threading.Event()
             self._watch_client(cancel)
             text, done = [], {}

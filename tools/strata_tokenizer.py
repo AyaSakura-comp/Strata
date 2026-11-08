@@ -203,15 +203,74 @@ class Tokenizer:
                     heapq.heappush(heap, (r2, p, parts[p], parts[i]))
         return [s for s in parts if s is not None]
 
+    # Caches (exact: both map a string to what the uncached code returns for it).  A chat prompt is mostly text the
+    # previous request also sent - a ~60K-character system prompt, then the conversation - and the pure-Python BPE of
+    # all of it took ~45 ms per request at 25K tokens, before the engine read anything (a pi research warm, the answer
+    # after it, /apply-template: each paid it again).
+    #   * a SEGMENT (the text between two literal tokens, which _encode_matching encodes on its own) of SEG_MIN
+    #     characters or more: its ids, in a small LRU bounded by entries and characters;
+    #   * a PIECE (one pre-token): its ids after BPE, in a dict dropped whole when it grows past PIECE_MAX.
+    SEG_MIN = 256
+    SEG_ENTRIES = 64
+    SEG_CHARS = 8_000_000
+    PIECE_MAX = 500_000
+
+    def clear_cache(self) -> None:
+        """Forget every cached segment and piece (tests comparing two BPE paths on one tokenizer)."""
+        lock = self.__dict__.get("_segs_lock")
+        if lock is not None:
+            with lock:
+                self._segs.clear()
+                self._segs_chars = 0
+        self.__dict__.pop("_pieces", None)
+
     def _encode_plain(self, text: str) -> list[int]:
+        if len(text) < self.SEG_MIN:
+            return self._encode_pieces(text)
+        segs = self.__dict__.get("_segs")
+        if segs is None:
+            import collections
+            import threading
+            segs = self.__dict__.setdefault("_segs", collections.OrderedDict())
+            self.__dict__.setdefault("_segs_lock", threading.Lock())
+            self.__dict__.setdefault("_segs_chars", 0)
+        lock = self._segs_lock
+        with lock:
+            hit = segs.get(text)
+            if hit is not None:
+                segs.move_to_end(text)
+                return list(hit)
+        ids = self._encode_pieces(text)
+        with lock:
+            if text not in segs:
+                segs[text] = tuple(ids)
+                self._segs_chars += len(text)
+                while segs and (len(segs) > self.SEG_ENTRIES or self._segs_chars > self.SEG_CHARS):
+                    old, _ = segs.popitem(last=False)
+                    self._segs_chars -= len(old)
+        return ids
+
+    def _encode_pieces(self, text: str) -> list[int]:
+        cache = self.__dict__.get("_pieces")
+        if cache is None:
+            cache = self.__dict__.setdefault("_pieces", {})
         out: list[int] = []
         for piece in self._re.findall(text):
+            hit = cache.get(piece)
+            if hit is not None:
+                out.extend(hit)
+                continue
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+            ids = []
             for tok in self._bpe(mapped):
                 i = self.ids.get(tok)
                 if i is None:
                     raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                out.append(i)
+                ids.append(i)
+            if len(cache) >= self.PIECE_MAX:
+                cache.clear()                           # (a dict swap is atomic under the GIL; no lock needed)
+            cache[piece] = tuple(ids)
+            out.extend(ids)
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
